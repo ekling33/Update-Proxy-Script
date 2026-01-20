@@ -1,8 +1,8 @@
-# Aggressive Microsoft 3D Viewer removal - clears remaining packages
-# Run as Admin, assumes WinRM on targets, machines.txt present
+# Remove Microsoft Paint 3D from remote VMs (fixes related QIDs)
+# Usage: Same as before - machines.txt, run as Admin
 
 $ErrorActionPreference = 'Stop'
-$machinesFile = 'machines.txt'
+$machinesFile = 'machines.txt'  # Or create machines_failed.txt for the 3
 
 if (-not (Test-Path $machinesFile)) { Write-Error "machines.txt missing."; exit 1 }
 
@@ -10,40 +10,37 @@ $machines = Get-Content $machinesFile | Where-Object { $_ -match '^\s*[\w\.\-\d]
 
 $results = foreach ($machine in $machines) {
     try {
-        Write-Host "Aggressively cleaning $machine..." -ForegroundColor Cyan
+        Write-Host "Removing Paint 3D from $machine..." -ForegroundColor Cyan
         $session = New-PSSession -ComputerName $machine -ErrorAction Stop
         
         $output = Invoke-Command -Session $session -ScriptBlock {
-            # Remove by exact names (handles renames/bundles)
-            $pkgNames = @(
-                'Microsoft.Microsoft3DViewer*',
-                '*3dviewer*'
-            )
+            # Target Paint 3D specifically
+            $pkgNames = @('Microsoft.MSPaint*', '*MSPaint*')
             
             foreach ($name in $pkgNames) {
                 Get-AppxPackage -AllUsers $name -PackageTypeFilter Bundle | 
                     Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
             }
             
-            # Deprovision all variants
+            # Deprovision
             Get-AppxProvisionedPackage -Online | Where-Object { 
-                $_.DisplayName -match '3DViewer|3dviewer' 
+                $_.DisplayName -match 'MSPaint|Paint3D|Paint 3D' 
             } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
             
-            # Nuke any leftover folders (post-removal)
+            # Leftover folders
             $appPaths = @(
-                "${env:ProgramFiles}\WindowsApps\Microsoft.Microsoft3DViewer*",
-                "${env:LOCALAPPDATA}\Packages\Microsoft.Microsoft3DViewer*"
+                "${env:ProgramFiles}\WindowsApps\Microsoft.MSPaint*",
+                "${env:LOCALAPPDATA}\Packages\Microsoft.MSPaint*"
             )
             foreach ($path in $appPaths) {
                 Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
             }
             
-            # Final count
-            $installed = (Get-AppxPackage *3dviewer* -AllUsers).Count
-            $provisioned = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*").Count
-            $totalRemaining = $installed + $provisioned
-            "SUCCESS: Installed: $installed | Provisioned: $provisioned | Total: $totalRemaining"
+            # Verify
+            $installed = (Get-AppxPackage *MSPaint* -AllUsers).Count
+            $provisioned = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*MSPaint*").Count
+            $total = $installed + $provisioned
+            "SUCCESS: Installed: $installed | Provisioned: $provisioned | Total: $total"
         }
         
         Remove-PSSession $session
@@ -54,6 +51,6 @@ $results = foreach ($machine in $machines) {
     }
 }
 
-$results | Out-File -FilePath "3DViewer-Full-Results.txt" -Force
-Write-Host "`nFull results: 3DViewer-Full-Results.txt" -ForegroundColor Green
+$results | Out-File -FilePath "Paint3D-Removal-Results.txt" -Force
+Write-Host "`nResults: Paint3D-Removal-Results.txt" -ForegroundColor Green
 $results
