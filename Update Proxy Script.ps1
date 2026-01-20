@@ -1,49 +1,59 @@
-# Remove Microsoft 3D Viewer from remote VMs to fix QIDs 92117/92061
-# Requires: Run as Administrator, WinRM enabled on targets, machines.txt with one FQDN/IP per line
+# Aggressive Microsoft 3D Viewer removal - clears remaining packages
+# Run as Admin, assumes WinRM on targets, machines.txt present
 
 $ErrorActionPreference = 'Stop'
 $machinesFile = 'machines.txt'
 
-if (-not (Test-Path $machinesFile)) {
-    Write-Error "machines.txt not found in current directory."
-    exit 1
-}
+if (-not (Test-Path $machinesFile)) { Write-Error "machines.txt missing."; exit 1 }
 
 $machines = Get-Content $machinesFile | Where-Object { $_ -match '^\s*[\w\.\-\d]+\s*$' } | ForEach-Object { $_.Trim() }
-if ($machines.Count -eq 0) {
-    Write-Warning "No valid machines found in $machinesFile"
-    exit 0
-}
 
 $results = foreach ($machine in $machines) {
     try {
-        Write-Host "Processing $machine..." -ForegroundColor Yellow
-        
+        Write-Host "Aggressively cleaning $machine..." -ForegroundColor Cyan
         $session = New-PSSession -ComputerName $machine -ErrorAction Stop
         
-        Invoke-Command -Session $session -ScriptBlock {
-            # Remove installed 3D Viewer for all users
-            Get-AppxPackage *3dviewer* -AllUsers | Remove-AppxPackage -ErrorAction SilentlyContinue
+        $output = Invoke-Command -Session $session -ScriptBlock {
+            # Remove by exact names (handles renames/bundles)
+            $pkgNames = @(
+                'Microsoft.Microsoft3DViewer*',
+                '*3dviewer*'
+            )
             
-            # Remove provisioned package to block on new profiles
-            Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*" | 
-                Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+            foreach ($name in $pkgNames) {
+                Get-AppxPackage -AllUsers $name -PackageTypeFilter Bundle | 
+                    Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            }
             
-            # Verify removal
-            $remaining = (Get-AppxPackage *3dviewer* -AllUsers).Count + 
-                         (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*").Count
-            "SUCCESS: $env:COMPUTERNAME - Remaining packages: $remaining"
+            # Deprovision all variants
+            Get-AppxProvisionedPackage -Online | Where-Object { 
+                $_.DisplayName -match '3DViewer|3dviewer' 
+            } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+            
+            # Nuke any leftover folders (post-removal)
+            $appPaths = @(
+                "${env:ProgramFiles}\WindowsApps\Microsoft.Microsoft3DViewer*",
+                "${env:LOCALAPPDATA}\Packages\Microsoft.Microsoft3DViewer*"
+            )
+            foreach ($path in $appPaths) {
+                Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Final count
+            $installed = (Get-AppxPackage *3dviewer* -AllUsers).Count
+            $provisioned = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*").Count
+            $totalRemaining = $installed + $provisioned
+            "SUCCESS: Installed: $installed | Provisioned: $provisioned | Total: $totalRemaining"
         }
         
         Remove-PSSession $session
-        "[$machine] SUCCESS"
+        "[$machine] $output"
     }
     catch {
         "[$machine] FAILED: $($_.Exception.Message)"
     }
 }
 
-# Output results
-$results | Out-File -FilePath "3DViewer-Removal-Results.txt"
-Write-Host "`nResults saved to 3DViewer-Removal-Results.txt" -ForegroundColor Green
-$results | ForEach-Object { Write-Host $_ }
+$results | Out-File -FilePath "3DViewer-Full-Results.txt" -Force
+Write-Host "`nFull results: 3DViewer-Full-Results.txt" -ForegroundColor Green
+$results
