@@ -1,29 +1,49 @@
-# Final PowerShell script: Reads machines.txt, sets WinHTTP proxy remotely as admin (no credential prompt)
-# Usage: Create machines.txt (one VM per line), run .\Set-ProxyRemotely.ps1 as Administrator
+# Remove Microsoft 3D Viewer from remote VMs to fix QIDs 92117/92061
+# Requires: Run as Administrator, WinRM enabled on targets, machines.txt with one FQDN/IP per line
 
-$machinesPath = "machines.txt"
-if (-not (Test-Path $machinesPath)) {
-    Write-Error "machines.txt not found in current directory. Create it with one VM hostname/IP per line."
+$ErrorActionPreference = 'Stop'
+$machinesFile = 'machines.txt'
+
+if (-not (Test-Path $machinesFile)) {
+    Write-Error "machines.txt not found in current directory."
     exit 1
 }
 
-$ComputerNames = Get-Content $machinesPath | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() }
+$machines = Get-Content $machinesFile | Where-Object { $_ -match '^\s*[\w\.\-\d]+\s*$' } | ForEach-Object { $_.Trim() }
+if ($machines.Count -eq 0) {
+    Write-Warning "No valid machines found in $machinesFile"
+    exit 0
+}
 
-Write-Host "Starting proxy update on $($ComputerNames.Count) machines from $machinesPath" -ForegroundColor Cyan
-
-foreach ($Computer in $ComputerNames) {
+$results = foreach ($machine in $machines) {
     try {
-        Invoke-Command -ComputerName $Computer -ScriptBlock {
-            $ProxyServer = "proxy.jimmy.com:8080"
-            netsh winhttp set proxy $ProxyServer
-            $CurrentProxy = netsh winhttp show proxy
-            "SUCCESS: Proxy set to $ProxyServer on $env:COMPUTERNAME"
-            $CurrentProxy
-        } -ErrorAction Stop | ForEach-Object { Write-Host $_ -ForegroundColor Green }
+        Write-Host "Processing $machine..." -ForegroundColor Yellow
+        
+        $session = New-PSSession -ComputerName $machine -ErrorAction Stop
+        
+        Invoke-Command -Session $session -ScriptBlock {
+            # Remove installed 3D Viewer for all users
+            Get-AppxPackage *3dviewer* -AllUsers | Remove-AppxPackage -ErrorAction SilentlyContinue
+            
+            # Remove provisioned package to block on new profiles
+            Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*" | 
+                Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+            
+            # Verify removal
+            $remaining = (Get-AppxPackage *3dviewer* -AllUsers).Count + 
+                         (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*").Count
+            "SUCCESS: $env:COMPUTERNAME - Remaining packages: $remaining"
+        }
+        
+        Remove-PSSession $session
+        "[$machine] SUCCESS"
     }
     catch {
-        Write-Warning "FAILED: $Computer - $($_.Exception.Message)"
+        "[$machine] FAILED: $($_.Exception.Message)"
     }
 }
 
-Write-Host "Proxy update process completed. Review output above." -ForegroundColor Yellow
+# Output results
+$results | Out-File -FilePath "3DViewer-Removal-Results.txt"
+Write-Host "`nResults saved to 3DViewer-Removal-Results.txt" -ForegroundColor Green
+$results | ForEach-Object { Write-Host $_ }
