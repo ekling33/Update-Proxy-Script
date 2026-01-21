@@ -1,34 +1,33 @@
-# QID-92030 Remover - WinRM No Prompts (After TrustedHosts)
-# FIRST: Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force  (or your machines)
-# Run as DOMAIN Admin
+# Remove-Teams.ps1 - Run as Administrator
+$machines = Get-Content .\machines.txt | Where-Object { $_.Trim() -ne '' }
+$logFile = "TeamsRemoval_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
-$machines = Get-Content .\machines.txt | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-$logFile = "RemovalResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-
-$scriptBlock = {
-    $apps = @('*RawImageExtension*', '*VP9VideoExtensions*')
-    foreach ($pattern in $apps) {
-        1..3 | % {
-            $pkgs = Get-AppxPackage -AllUsers $pattern -ea SilentlyContinue
-            if ($pkgs) { $pkgs | Remove-AppxPackage -AllUsers -ErrorAction Stop }
+foreach ($computer in $machines) {
+    $computer = $computer.Trim()
+    try {
+        $result = Invoke-Command -ComputerName $computer -ScriptBlock {
+            # Stop Teams processes
+            Get-Process msteams -ErrorAction SilentlyContinue | Stop-Process -Force
             Start-Sleep 3
-        }
+
+            # Remove AppX package for all users
+            Get-AppxPackage *MSTeams* -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+
+            # Remove provisioned package
+            Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*MSTeams*" } | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction SilentlyContinue
+
+            # Remove MSI if present (Machine-Wide Installer)
+            $msi = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Teams Machine-Wide*" }
+            if ($msi) { $msi.Uninstall() }
+
+            "Teams removal completed successfully."
+        } -ErrorAction Stop
+
+        "$computer`: SUCCESS - $result" | Tee-Object -FilePath $logFile -Append
     }
-    Get-AppXProvisionedPackage -Online | ? DisplayName -match 'RawImageExtension|VP9VideoExtensions' | Remove-AppxProvisionedPackage -Online -ea SilentlyContinue
-    gps Microsoft.Photos*,Movies*,*Store* | sp -Force -ea SilentlyContinue
-    $p = 'C:\Program Files\WindowsApps'
-    if (Test-Path $p) { ri "$p\*Raw*" -Recurse -Force -ea SilentlyContinue; ri "$p\*VP9*" -Recurse -Force -ea SilentlyContinue }
-    $rem = Get-AppxPackage -AllUsers '*Raw*|*VP9*' -ea SilentlyContinue
-    if (-not $rem) { "SUCCESS on $env:COMPUTERNAME" } else { "REMNANTS: $($rem.Name)" }
+    catch {
+        "$computer`: FAILED - $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+    }
 }
 
-foreach ($m in $machines) {
-    $ts = Get-Date -f 'yyyy-MM-dd HH:mm:ss'
-    if (Test-WSMan $m -ea SilentlyContinue) {
-        $out = Invoke-Command -ComputerName $m -ScriptBlock $scriptBlock -ea Stop 2>&1
-        "[$ts] SUCCESS $m`n$out`n" | Tee -FilePath $logFile -Append
-    } else {
-        "[$ts] FAILED $m - No WinRM`n" | Tee -FilePath $logFile -Append
-    }
-}
-"Done. Log: $logFile"
+Write-Host "Script complete. Check $logFile for details." [web:16][web:10][web:3]
