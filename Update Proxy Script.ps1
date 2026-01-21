@@ -1,33 +1,48 @@
-# Remove-Teams.ps1 - Run as Administrator
-$machines = Get-Content .\machines.txt | Where-Object { $_.Trim() -ne '' }
-$logFile = "TeamsRemoval_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+# PowerShell script to remove Web Media Extensions from remote Windows 10 VMs
+# Run as Administrator. Requires WinRM enabled on targets (Enable-PSRemoting -Force)
+# machines.txt: one hostname/IP per line
 
-foreach ($computer in $machines) {
-    $computer = $computer.Trim()
+# Read target machines
+$machines = Get-Content -Path "machines.txt" | Where-Object { $_ -match '\S' }
+
+foreach ($machine in $machines) {
+    Write-Host "Processing $machine..." -ForegroundColor Yellow
+    
     try {
-        $result = Invoke-Command -ComputerName $computer -ScriptBlock {
-            # Stop Teams processes
-            Get-Process msteams -ErrorAction SilentlyContinue | Stop-Process -Force
-            Start-Sleep 3
-
-            # Remove AppX package for all users
-            Get-AppxPackage *MSTeams* -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-
-            # Remove provisioned package
-            Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*MSTeams*" } | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction SilentlyContinue
-
-            # Remove MSI if present (Machine-Wide Installer)
-            $msi = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Teams Machine-Wide*" }
-            if ($msi) { $msi.Uninstall() }
-
-            "Teams removal completed successfully."
+        Invoke-Command -ComputerName $machine -ScriptBlock {
+            # Remove installed packages for all users
+            $pkg = Get-AppxPackage -AllUsers *WebMediaExtensions* -ErrorAction SilentlyContinue
+            if ($pkg) {
+                $pkg | Remove-AppxPackage -ErrorAction Stop
+                Write-Output "Removed installed Web Media Extensions packages."
+            } else {
+                Write-Output "No installed Web Media Extensions packages found."
+            }
+            
+            # Remove provisioned packages
+            $provPkg = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.WebMediaExtensions" }
+            if ($provPkg) {
+                $provPkg | Remove-AppxProvisionedPackage -Online -ErrorAction Stop
+                Write-Output "Removed provisioned Web Media Extensions package."
+            } else {
+                Write-Output "No provisioned Web Media Extensions package found."
+            }
+            
+            # Verification
+            $verifyInstalled = Get-AppxPackage -AllUsers *WebMediaExtensions* -ErrorAction SilentlyContinue
+            $verifyProv = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.WebMediaExtensions" }
+            if (-not $verifyInstalled -and -not $verifyProv) {
+                Write-Output "SUCCESS: Web Media Extensions fully removed."
+            } else {
+                Write-Warning "Partial removal - rescan recommended."
+            }
         } -ErrorAction Stop
-
-        "$computer`: SUCCESS - $result" | Tee-Object -FilePath $logFile -Append
     }
     catch {
-        "$computer`: FAILED - $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        Write-Warning "Failed on $machine`: $($_.Exception.Message)"
     }
+    
+    Write-Host "Completed $machine`n" -ForegroundColor Green
 }
 
-Write-Host "Script complete. Check $logFile for details." [web:16][web:10][web:3]
+Write-Host "Script finished. Reboot targets and rescan with Qualys for QID-91764." -ForegroundColor Cyan
