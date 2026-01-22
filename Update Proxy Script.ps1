@@ -1,72 +1,54 @@
-# Updated PowerShell script to remove Web Media Extensions from remote Windows 10 VMs
-# Handles HRESULT 0x80073D19 "user logged off" by skipping inactive user packages
-# Run as Administrator. Requires WinRM enabled on targets (Enable-PSRemoting -Force)
-# machines.txt: one hostname/IP per line
+# Remote Web Media Extensions user profile scanner
+# Run as Administrator. Scans machines.txt for per-user package details
+# Requires WinRM enabled on targets
 
-# Read target machines
 $machines = Get-Content -Path "machines.txt" | Where-Object { $_ -match '\S' }
 
 foreach ($machine in $machines) {
-    Write-Host "Processing $machine..." -ForegroundColor Yellow
+    Write-Host "`n=== SCANNING $machine ===" -ForegroundColor Yellow
     
     try {
         Invoke-Command -ComputerName $machine -ScriptBlock {
-            # Robust removal for installed packages (handles logged-off users)
-            $pkgs = Get-AppxPackage -AllUsers *WebMediaExtensions* -ErrorAction SilentlyContinue
-            if ($pkgs) {
-                foreach ($pkg in $pkgs) {
-                    try {
-                        Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
-                        Write-Output "Removed: $($pkg.PackageFullName)"
-                    }
-                    catch {
-                        if ($_.Exception.Message -like "*0x80073D19*" -or $_.Exception.Message -like "*logged off*") {
-                            Write-Output "Skipped inactive user package: $($pkg.PackageFullName)"
-                        } else {
-                            Write-Warning "Failed $($pkg.PackageFullName): $($_.Exception.Message)"
+            $webMediaPkgs = Get-AppxPackage -AllUsers *WebMediaExtensions* -ErrorAction SilentlyContinue
+            
+            if (-not $webMediaPkgs) {
+                Write-Host "✓ No Web Media Extensions packages found. CLEAN!" -ForegroundColor Green
+                return
+            }
+            
+            Write-Host "Found $($webMediaPkgs.Count) package(s):" -ForegroundColor Red
+            
+            foreach ($pkg in $webMediaPkgs | Sort-Object Name) {
+                Write-Host "`n  Package: $($pkg.Name) v$($pkg.Version)" -ForegroundColor Yellow
+                Write-Host "  FullName: $($pkg.PackageFullName)" -ForegroundColor Gray
+                
+                if ($pkg.PackageUserInformation) {
+                    foreach ($userInfo in $pkg.PackageUserInformation) {
+                        $sid = $userInfo.UserSecurityId
+                        $profile = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue
+                        $profilePath = $profile.ProfileImagePath
+                        $username = if ($profilePath) { Split-Path $profilePath -Leaf } else { "DELETED" }
+                        $state = if ($userInfo.IsCurrentUser) { 
+                            "ACTIVE (Current User: $env:USERNAME)" 
+                        } elseif ($profilePath -and (Test-Path $profilePath)) { 
+                            "INACTIVE LOCAL PROFILE" 
+                        } elseif ($profile) { 
+                            "ORPHANED SID (Profile Deleted)" 
+                        } else { 
+                            "UNKNOWN SID" 
                         }
+                        
+                        Write-Host "    SID: $sid | User: $username | State: $state" -ForegroundColor White
                     }
+                } else {
+                    Write-Host "    No user info (rare system package)" -ForegroundColor Cyan
                 }
-            } else {
-                Write-Output "No installed Web Media Extensions packages found."
             }
-            
-            # Remove provisioned packages (SYSTEM-level, no user issues)
-            $provPkgs = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*WebMediaExtensions*" }
-            if ($provPkgs) {
-                foreach ($provPkg in $provPkgs) {
-                    try {
-                        Remove-AppxProvisionedPackage -Online -PackageName $provPkg.PackageName -ErrorAction Stop
-                        Write-Output "Removed provisioned: $($provPkg.DisplayName)"
-                    }
-                    catch {
-                        Write-Warning "Failed provisioned $($provPkg.DisplayName): $($_.Exception.Message)"
-                    }
-                }
-            } else {
-                Write-Output "No provisioned Web Media Extensions found."
-            }
-            
-            # Verification
-            $verifyInstalled = Get-AppxPackage -AllUsers *WebMediaExtensions* -ErrorAction SilentlyContinue
-            $verifyProv = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*WebMediaExtensions*" }
-            $remaining = @($verifyInstalled.Count + $verifyProv.Count)
-            if ($remaining -eq 0) {
-                Write-Output "SUCCESS: Web Media Extensions fully removed."
-            } else {
-                Write-Warning "Remaining packages: $remaining (likely inactive users - safe after provisioned removal)"
-            }
-            
-            # Optional: Clean WindowsApps folders (run if access allows)
-            Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.WebMediaExtensions*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Output "Cleaned WindowsApps folders."
         } -ErrorAction Stop
     }
     catch {
-        Write-Warning "Failed on $machine`: $($_.Exception.Message)"
+        Write-Warning "Failed $machine`: $($_.Exception.Message)"
     }
-    
-    Write-Host "Completed $machine`n" -ForegroundColor Green
 }
 
-Write-Host "Script finished. Reboot targets (Restart-Computer -ComputerName (Get-Content machines.txt) -Force), then rescan Qualys for QID-91764." -ForegroundColor Cyan
+Write-Host "`nNext: Use logon scripts for ACTIVE/INACTIVE users. ORPHANED safe to ignore." -ForegroundColor Cyan
