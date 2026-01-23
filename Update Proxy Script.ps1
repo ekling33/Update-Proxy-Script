@@ -3,55 +3,65 @@ param(
     [string]$ComputerName
 )
 
-# Step 1: Set registry key remotely to allow special profile deployments
+# Target package DisplayName / Name
+$pkgName = "Microsoft.WebMediaExtensions"
+
+Write-Host "=== Step 1: Enable deployment in special profiles on $ComputerName ==="
+
 $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
 $regName = "AllowDeploymentInSpecialProfiles"
 $regValue = 1
 
 Invoke-Command -ComputerName $ComputerName -ScriptBlock {
     param($Path, $Name, $Value)
-    
-    # Create path if missing
+
+    # Create policy path if missing
     if (-not (Test-Path $Path)) {
         New-Item -Path $Path -Force | Out-Null
     }
-    
-    # Set DWORD
+
+    # Set DWORD to allow deployment in special profiles
     Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord -Force
-    
-    # Update policy
+
     gpupdate /force /wait:0
 } -ArgumentList $regPath, $regName, $regValue
 
 Write-Host "Registry updated on $ComputerName. Initiating reboot..."
 
-# Step 2: Reboot (waits for completion)
+Write-Host "=== Step 2: Rebooting $ComputerName and waiting for PowerShell availability ==="
+
 Restart-Computer -ComputerName $ComputerName -Force -Wait -For PowerShell -Timeout 600 -Delay 30
 
-Write-Host "Reboot complete. Removing 3D Viewer..."
+Write-Host "Reboot complete. Connecting back to $ComputerName for removal..."
 
-# Step 3: Run cleanup script post-reboot
+Write-Host "=== Step 3: Removing Web Media Extensions (Windows Codecs Library) on $ComputerName ==="
+
 $result = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
-    $pkgName = "Microsoft.Microsoft3DViewer"
-    
-    # Remove user packages
-    Get-AppxPackage -AllUsers -Name $pkgName -PackageTypeFilter Bundle | 
+    param($InnerPkgName)
+
+    # Remove user packages (all users, bundle aware)
+    Get-AppxPackage -AllUsers -Name $InnerPkgName -PackageTypeFilter Bundle |
         Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-    
-    # Remove provisioned
-    Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $pkgName | 
+
+    # Also catch non-bundle variants if any
+    Get-AppxPackage -AllUsers -Name $InnerPkgName |
+        Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+
+    # Remove provisioned copy
+    Get-AppxProvisionedPackage -Online |
+        Where-Object DisplayName -EQ $InnerPkgName |
         Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
-    
-    # Verify & return counts
-    $userCount = (Get-AppxPackage -AllUsers -Name $pkgName | Measure-Object).Count
-    $provCount = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $pkgName | Measure-Object).Count
-    
-    # Revert registry
+
+    # Verify counts
+    $userCount = (Get-AppxPackage -AllUsers -Name $InnerPkgName | Measure-Object).Count
+    $provCount = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $InnerPkgName | Measure-Object).Count
+
+    # Optional: revert registry flag
     $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
     Remove-ItemProperty -Path $regPath -Name "AllowDeploymentInSpecialProfiles" -ErrorAction SilentlyContinue
-    
-    return @{Users = $userCount; Provisioned = $provCount}
-}
 
-Write-Host "3D Viewer removal complete on $ComputerName."
+    return @{Users = $userCount; Provisioned = $provCount}
+} -ArgumentList $pkgName
+
+Write-Host "=== Web Media Extensions removal complete on $ComputerName ==="
 Write-Host "Users: $($result.Users), Provisioned: $($result.Provisioned)"
