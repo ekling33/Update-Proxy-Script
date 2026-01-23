@@ -1,17 +1,14 @@
-# Remove from all users (handles the "still installed" part)
-Get-AppxPackage -AllUsers -Name Microsoft.Microsoft3DViewer -PackageTypeFilter Bundle |
-    Remove-AppxPackage -AllUsers
+# Full 3D Viewer cleanup (fixed)
+$pkgName = "Microsoft.Microsoft3DViewer"
 
-# Remove provisioned (prevents reinstall)
-Get-AppxProvisionedPackage -Online -PackageName "*Microsoft.Microsoft3DViewer*" |
-    Remove-AppxProvisionedPackage -Online
+# Remove from all users
+Get-AppxPackage -AllUsers -Name $pkgName -PackageTypeFilter Bundle | 
+    Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
 
+# Remove provisioned (CORRECTED: no -PackageName param)
+Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $pkgName | 
+    Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
 
-
-
-#REBOOT, THEN
-Get-AppxPackage -AllUsers -Name Microsoft.Microsoft3DViewer
-Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*3DViewer*"
-
-
-dir "C:\Program Files\WindowsApps\Microsoft.Microsoft3DViewer*"
+# Verify
+Write-Host "Users: " (Get-AppxPackage -AllUsers -Name $pkgName | Measure-Object).Count
+Write-Host "Provisioned: " (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $pkgName | Measure-Object).Count
