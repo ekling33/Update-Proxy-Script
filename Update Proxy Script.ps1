@@ -1,5 +1,5 @@
-# Remove-RawVP9Extensions-Multi.ps1
-# Removes MS Raw Image Extension + VP9 Video Extensions from machines.txt
+# Remove-Paint3D-Multi.ps1
+# Removes Paint 3D from machines.txt
 # NO REBOOT - registry applied immediately via gpupdate
 # Run as admin
 
@@ -20,8 +20,8 @@ $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
 $regName = "AllowDeploymentInSpecialProfiles"
 $regValue = 1
 
-# BOTH packages
-$packages = @("Microsoft.RawImageExtension", "Microsoft.VP9VideoExtensions")
+# Paint 3D package
+$pkgName = "Microsoft.MSPaint"  # Paint 3D AppX name
 
 $results = @()
 
@@ -42,58 +42,47 @@ foreach ($ComputerName in $ComputerNames) {
             gpupdate /force /wait:0
         } -ArgumentList $regPath, $regName, $regValue
 
-        # Step 2: Remove BOTH packages immediately
+        # Step 2: Remove Paint 3D immediately
         $result = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
-            param($PkgList)
+            param($InnerPkgName)
 
-            $report = @{}
-
-            foreach ($pkgName in $PkgList) {
-                # User packages (bundle + regular)
-                Get-AppxPackage -AllUsers -Name $pkgName -PackageTypeFilter Bundle |
-                    Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-                
-                Get-AppxPackage -AllUsers -Name $pkgName |
-                    Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-                
-                # Provisioned
-                Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $pkgName |
-                    Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
-                
-                # Counts
-                $userCount = (Get-AppxPackage -AllUsers -Name $pkgName | Measure-Object).Count
-                $provCount = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $pkgName | Measure-Object).Count
-                
-                $report[$pkgName] = @{Users = $userCount; Provisioned = $provCount}
-            }
-
+            # User packages (bundle + regular)
+            Get-AppxPackage -AllUsers -Name $InnerPkgName -PackageTypeFilter Bundle |
+                Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            
+            Get-AppxPackage -AllUsers -Name $InnerPkgName |
+                Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            
+            # Provisioned
+            Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $InnerPkgName |
+                Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+            
+            # Counts
+            $userCount = (Get-AppxPackage -AllUsers -Name $InnerPkgName | Measure-Object).Count
+            $provCount = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $InnerPkgName | Measure-Object).Count
+            
             # Revert registry immediately
             $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
             Remove-ItemProperty -Path $regPath -Name "AllowDeploymentInSpecialProfiles" -ErrorAction SilentlyContinue
             
-            return $report
-        } -ArgumentList $packages
+            return @{Users = $userCount; Provisioned = $provCount}
+        } -ArgumentList $pkgName
 
         $results += [PSCustomObject]@{
             ComputerName = $ComputerName
-            RawImageUsers = $result["Microsoft.RawImageExtension"].Users
-            RawImageProv  = $result["Microsoft.RawImageExtension"].Provisioned
-            VP9Users      = $result["Microsoft.VP9VideoExtensions"].Users
-            VP9Prov       = $result["Microsoft.VP9VideoExtensions"].Provisioned
-            Status        = "Success"
+            Paint3DUsers = $result.Users
+            Paint3DProv  = $result.Provisioned
+            Status       = "Success"
         }
         
-        Write-Host "  ✓ Raw Image: Users=$($result['Microsoft.RawImageExtension'].Users), Prov=$($result['Microsoft.RawImageExtension'].Provisioned)"
-        Write-Host "  ✓ VP9 Video: Users=$($result['Microsoft.VP9VideoExtensions'].Users), Prov=$($result['Microsoft.VP9VideoExtensions'].Provisioned)"
+        Write-Host "  ✓ Paint 3D: Users=$($result.Users), Prov=$($result.Provisioned)"
         
     } catch {
         $results += [PSCustomObject]@{
             ComputerName = $ComputerName
-            RawImageUsers = "N/A"
-            RawImageProv  = "N/A"
-            VP9Users      = "N/A"
-            VP9Prov       = "N/A"
-            Status        = $_.Exception.Message -replace "`n"," "
+            Paint3DUsers = "N/A"
+            Paint3DProv  = "N/A"
+            Status       = $_.Exception.Message -replace "`n"," "
         }
         Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -103,6 +92,6 @@ foreach ($ComputerName in $ComputerNames) {
 Write-Host "`n=== SUMMARY ===" -ForegroundColor Yellow
 $results | Format-Table -AutoSize
 
-$csvPath = "RawVP9-Removal-Results-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+$csvPath = "Paint3D-Removal-Results-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation
 Write-Host "Results saved: $csvPath" -ForegroundColor Cyan
