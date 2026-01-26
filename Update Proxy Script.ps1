@@ -1,10 +1,7 @@
 # Remove-RawVP9Extensions-Multi.ps1
-# Removes BOTH MS Raw Image Extension AND VP9 Video Extensions from machines.txt
-# Run as admin. No reboot required.
-
-param(
-    [switch]$IncludeReboot
-)
+# Removes MS Raw Image Extension + VP9 Video Extensions from machines.txt
+# NO REBOOT - registry applied immediately via gpupdate
+# Run as admin
 
 # Load targets from machines.txt
 if (-not (Test-Path "machines.txt")) {
@@ -37,7 +34,7 @@ foreach ($ComputerName in $ComputerNames) {
             throw "WinRM not available"
         }
 
-        # Step 1: Enable special profile deployment
+        # Step 1: Enable special profile deployment (immediate)
         Invoke-Command -ComputerName $ComputerName -ScriptBlock {
             param($Path, $Name, $Value)
             if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
@@ -45,12 +42,7 @@ foreach ($ComputerName in $ComputerNames) {
             gpupdate /force /wait:0
         } -ArgumentList $regPath, $regName, $regValue
 
-        if ($IncludeReboot) {
-            Write-Host "  Rebooting..."
-            Restart-Computer -ComputerName $ComputerName -Force -Wait -For PowerShell -Timeout 600 -Delay 30
-        }
-
-        # Step 2: Remove BOTH packages
+        # Step 2: Remove BOTH packages immediately
         $result = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
             param($PkgList)
 
@@ -75,7 +67,7 @@ foreach ($ComputerName in $ComputerNames) {
                 $report[$pkgName] = @{Users = $userCount; Provisioned = $provCount}
             }
 
-            # Revert registry
+            # Revert registry immediately
             $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
             Remove-ItemProperty -Path $regPath -Name "AllowDeploymentInSpecialProfiles" -ErrorAction SilentlyContinue
             
