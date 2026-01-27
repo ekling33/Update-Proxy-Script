@@ -1,88 +1,61 @@
-# Remove-Paint3D-Multi.ps1
-# Removes Paint 3D from machines.txt - NO REBOOT
-# Run as admin
+param(
+    [switch]$IncludeReboot
+)
 
 if (-not (Test-Path "machines.txt")) {
-    Write-Error "Create machines.txt with one hostname/IP per line first."
+    Write-Error "Create machines.txt with one hostname/IP per line."
     exit 1
 }
 
-$ComputerNames = Get-Content "machines.txt" | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() }
-
-if ($ComputerNames.Count -eq 0) {
-    Write-Error "No valid machines found in machines.txt"
-    exit 1
-}
-
-$regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
-$regName = "AllowDeploymentInSpecialProfiles"
-$regValue = 1
-$pkgName = "Microsoft.MSPaint"
-
+$machines = Get-Content "machines.txt"
 $results = @()
 
-foreach ($ComputerName in $ComputerNames) {
-    Write-Host "`n=== Processing $ComputerName ===" -ForegroundColor Green
-    
+foreach ($machine in $machines) {
+    $result = [PSCustomObject]@{
+        Machine = $machine
+        ChromePreVersion = $null
+        UpdateSuccess = $false
+        Error = $null
+    }
+
     try {
-        if (-not (Test-WSMan -ComputerName $ComputerName -ErrorAction SilentlyContinue)) {
-            throw "WinRM not available"
-        }
+        Invoke-Command -ComputerName $machine -ScriptBlock {
+            $chromePath = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+            $updateExe = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
 
-        Invoke-Command -ComputerName $ComputerName -ScriptBlock {
-            param($Path, $Name, $Value)
-            if (-not (Test-Path $Path)) { 
-                New-Item -Path $Path -Force | Out-Null 
+            # Get current version
+            $version = if (Test-Path $chromePath) { (Get-Item $chromePath).VersionInfo.FileVersion } else { "Not Installed" }
+
+            # Kill Chrome processes
+            Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
+
+            # Trigger update if updater exists
+            if (Test-Path $updateExe) {
+                Start-Process -FilePath $updateExe -ArgumentList "/ua /installsource scheduler" -NoNewWindow -Wait
+                $updateSuccess = $true
+            } else {
+                $updateSuccess = $false
             }
-            Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord -Force
-            gpupdate /force /wait:0
-        } -ArgumentList $regPath, $regName, $regValue
 
-        $result = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
-            param($InnerPkgName)
-
-            Get-AppxPackage -AllUsers -Name $InnerPkgName -PackageTypeFilter Bundle |
-                Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-            
-            Get-AppxPackage -AllUsers -Name $InnerPkgName |
-                Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-            
-            Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $InnerPkgName |
-                Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
-            
-            $userCount = (Get-AppxPackage -AllUsers -Name $InnerPkgName | Measure-Object).Count
-            $provCount = (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -EQ $InnerPkgName | Measure-Object).Count
-            
-            $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx"
-            Remove-ItemProperty -Path $regPath -Name "AllowDeploymentInSpecialProfiles" -ErrorAction SilentlyContinue
-            
-            return @{Users = $userCount; Provisioned = $provCount}
-        } -ArgumentList $pkgName
-
-        $results += [PSCustomObject]@{
-            ComputerName = $ComputerName
-            Paint3DUsers = $result.Users
-            Paint3DProv  = $result.Provisioned
-            Status       = "Success"
+            # Return results (version may not update immediately; relaunch Chrome to apply)
+            "PreVersion: $version; Success: $updateSuccess"
+        } -ErrorAction Stop | ForEach-Object {
+            if ($_ -match "PreVersion: (.+); Success: (.+)") {
+                $result.ChromePreVersion = $matches[1]
+                $result.UpdateSuccess = ($matches[2] -eq "True")
+            }
         }
-        
-        Write-Host "  ✓ Paint 3D: Users=$($result.Users), Prov=$($result.Provisioned)"
-        
     }
     catch {
-        $results += [PSCustomObject]@{
-            ComputerName = $ComputerName
-            Paint3DUsers = "N/A"
-            Paint3DProv  = "N/A"
-            Status       = $_.Exception.Message
-        }
-        Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+        $result.Error = $_.Exception.Message
+    }
+
+    $results += $result
+
+    if ($IncludeReboot) {
+        Restart-Computer -ComputerName $machine -Force
     }
 }
 
-Write-Host "`n=== SUMMARY ===" -ForegroundColor Yellow
-$results | Format-Table -AutoSize
-
-$csvPath = "Paint3D-Removal-Results-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
-$results | Export-Csv -Path $csvPath -NoTypeInformation
-Write-Host "Results saved: $csvPath" -ForegroundColor Cyan
+$results | Export-Csv "Chrome-Update-Results-$(Get-Date -Format 'yyyyMMdd-HHmm').csv" -NoTypeInformation
+Write-Host "Results exported to CSV. Check post-update versions manually or re-run." -ForegroundColor Cyan
