@@ -1,12 +1,6 @@
-# 1) Check all known packages by wildcard
-Get-AppxPackage -AllUsers "*VP9*" | Select Name, PackageFullName, Version
-Get-AppxProvisionedPackage -Online | Where DisplayName -like "*VP9*"
+# Target the EXACT package
+Get-AppxPackage -Package "Microsoft.VP9VideoExtensions_1.0.50481.0_x64_8wekyb3d8bbwe" -AllUsers |
+    Remove-AppxPackage -AllUsers
 
-Get-AppxPackage -AllUsers "*Raw*" | Select Name, PackageFullName, Version
-Get-AppxProvisionedPackage -Online | Where DisplayName -like "*Raw*"
-
-Get-AppxPackage -AllUsers "Microsoft.MSPaint" | Select Name, PackageFullName, Version
-Get-AppxProvisionedPackage -Online | Where DisplayName -eq "Microsoft.MSPaint"
-
-Get-AppxPackage -AllUsers "*Print3D*" | Select Name, PackageFullName, Version
-Get-AppxProvisionedPackage -Online | Where DisplayName -like "*Print3D*"
+# Double-check
+Get-AppxPackage "*VP9*"
