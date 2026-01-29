@@ -1,9 +1,9 @@
-# Check-VDIDiskSpace.ps1
+# Check-VDIDiskSpace.ps1 (Updated for 15GB threshold, machine names only in output)
 $machines = Get-Content -Path "machines.txt" | Where-Object { $_.Trim() -ne "" }
 $lowSpaceVMs = @()
-$tenGB = 10GB
+$fifteenGB = 15GB
 
-Write-Host "Checking disk space on VMs..." -ForegroundColor Green
+Write-Host "Checking C: and fixed drives for <15GB free (patching safe threshold)..." -ForegroundColor Green
 
 foreach ($vm in $machines) {
     $vm = $vm.Trim()
@@ -17,13 +17,13 @@ foreach ($vm in $machines) {
                      @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}}
         
         if ($disks) {
-            $lowDrives = $disks | Where-Object { $_.FreeGB -lt 10 }
+            $lowDrives = $disks | Where-Object { $_.FreeGB -lt 15 }
             if ($lowDrives) {
-                Write-Host "  LOW SPACE on $vm :" -ForegroundColor Red
+                Write-Host "  LOW SPACE (<15GB) on $vm :" -ForegroundColor Red
                 $lowDrives | Format-Table -AutoSize
-                $lowSpaceVMs += "$vm has low space drives: $($lowDrives.DeviceID -join ', ')"
+                $lowSpaceVMs += $vm  # Just the machine name
             } else {
-                Write-Host "  All drives OK on $vm" -ForegroundColor Green
+                Write-Host "  All fixed drives >=15GB on $vm" -ForegroundColor Green
             }
         }
     }
@@ -32,6 +32,11 @@ foreach ($vm in $machines) {
     }
 }
 
-# Output file
+# Output file: Only low-space machine names, one per line
 $lowSpaceVMs | Out-File -FilePath "Output_VDI.txt" -Encoding UTF8
-Write-Host "`nLow space VMs saved to Output_VDI.txt" -ForegroundColor Green
+Write-Host "`nLow space VMs (<15GB) saved to Output_VDI.txt (machine names only):" -ForegroundColor Green
+$lowSpaceVMs | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+
+if ($lowSpaceVMs.Count -eq 0) {
+    Write-Host "  No VMs below 15GB threshold." -ForegroundColor Green
+}
