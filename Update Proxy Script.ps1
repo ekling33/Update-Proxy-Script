@@ -1,52 +1,59 @@
-# Path to the list of target machines
-$Computers = Get-Content -Path ".\machines.txt"
+# Clear O365 caches and registry for all profiles - Run as Administrator
+# Logs to C:\O365Cleanup.log
 
-foreach ($Computer in $Computers) {
-    Write-Host "Processing $Computer ..." -ForegroundColor Cyan
-    try {
-        Invoke-Command -ComputerName $Computer -ScriptBlock {
-            # Get all profile directories under C:\Users
-            $userProfileDirs = Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue
+$LogPath = "C:\temp\O365Cleanup.log"
+function Write-Log { param([string]$Message); "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) - $Message" | Out-File -FilePath $LogPath -Append; Write-Host $Message }
 
-            foreach ($dir in $userProfileDirs) {
-                # Eclipse path
-                $eclipsePath = Join-Path -Path $dir.FullName -ChildPath 'AppData\Roaming\Eclipse'
-                if (Test-Path -Path $eclipsePath) {
-                    Write-Output "Deleting Eclipse: $eclipsePath"
-                    Remove-Item -Path $eclipsePath -Recurse -Force -ErrorAction SilentlyContinue
-                }
+Write-Log "Starting O365 cleanup for all profiles."
 
-                # Teams path
-                $teamsPath = Join-Path -Path $dir.FullName -ChildPath 'AppData\Roaming\Microsoft\Teams'
-                if (Test-Path -Path $teamsPath) {
-                    Write-Output "Deleting Teams: $teamsPath"
-                    Remove-Item -Path $teamsPath -Recurse -Force -ErrorAction SilentlyContinue
-                }
-
-                # All .ost files in Outlook dir
-                $outlookDir = Join-Path -Path $dir.FullName -ChildPath 'AppData\Local\Microsoft\Outlook'
-                if (Test-Path -Path $outlookDir) {
-                    $ostFiles = Get-ChildItem -Path $outlookDir -Filter "*.ost" -File -ErrorAction SilentlyContinue
-                    foreach ($ost in $ostFiles) {
-                        Write-Output "Deleting OST: $($ost.FullName)"
-                        Remove-Item -Path $ost.FullName -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            }
-        } -ErrorAction Stop
-
-        # Report C: free space after deletions
-        $diskInfo = Invoke-Command -ComputerName $Computer -ScriptBlock {
-            $drive = Get-PSDrive -Name C
-            [PSCustomObject]@{
-                FreeGB = [math]::Round($drive.Free / 1GB, 2)
-                TotalGB = [math]::Round($drive.Used / 1GB + $drive.Free / 1GB, 2)
-                FreePercent = [math]::Round(($drive.Free / ($drive.Used + $drive.Free)) * 100, 1)
+# Get all profiles from registry
+$ProfileList = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue
+foreach ($ProfileKey in $ProfileList) {
+    $ProfilePath = (Get-ItemProperty -Path $ProfileKey.PSPath -Name ProfileImagePath).ProfileImagePath
+    if ($ProfilePath -match 'Default|Public|All Users|Temp') { continue }
+    
+    $UserName = Split-Path $ProfilePath -Leaf
+    $SID = $ProfileKey.PSChildName
+    $Loaded = Test-Path "HKU:\$SID"
+    
+    Write-Log "Processing profile: $UserName ($SID) - Loaded: $Loaded"
+    
+    # Clear files/caches (always safe, skips locked)
+    $CachePaths = @(
+        "$ProfilePath\AppData\Local\Microsoft\IdentityCache",
+        "$ProfilePath\AppData\Local\Microsoft\OneAuth",
+        "$ProfilePath\AppData\Local\Microsoft\Office\16.0\OfficeFileCache",
+        "$ProfilePath\AppData\Local\Microsoft\Outlook"
+    )
+    foreach ($CachePath in $CachePaths) {
+        if (Test-Path $CachePath) {
+            try {
+                Remove-Item -Path $CachePath -Recurse -Force -ErrorAction Stop
+                Write-Log "Deleted: $CachePath"
+            } catch {
+                Write-Log "Skipped locked: $CachePath"
             }
         }
-        Write-Host "C: Free Space on $Computer : $($diskInfo.FreeGB) GB / $($diskInfo.TotalGB) GB ($($diskInfo.FreePercent)% free)" -ForegroundColor Green
     }
-    catch {
-        Write-Warning "Failed on $Computer : $($_.Exception.Message)"
+    
+    # Clear registry if unloaded
+    if (-not $Loaded) {
+        $HivePath = "HKEY_USERS\$SID"
+        if (Test-Path $HivePath) {
+            Remove-Item "$HivePath\SOFTWARE\Microsoft\Office\16.0\Common\Identity" -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item "$HivePath\SOFTWARE\Microsoft\Office\16.0\Outlook\Profiles" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Cleared registry Identity/Profiles for unloaded profile."
+        }
+    } else {
+        Write-Log "Skipped registry for loaded profile $SID (logoff user first)."
     }
+    
+    # Clear credentials (system-wide where applicable)
+    cmdkey /list:$SID | Out-Null
+    cmdkey /delete:$SID 2>$null
 }
+
+# System-wide credentials for O365
+cmd /c "cmdkey /list | findstr /I o365 microsoftoffice outlook | for /F %i in ('cmdkey /list ^| findstr /I o365 microsoftoffice outlook') do cmdkey /delete %i" 2>$null
+
+Write-Log "Cleanup complete. Review log and restart."
