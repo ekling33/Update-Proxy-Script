@@ -1,9 +1,5 @@
-schtasks.exe /delete /tn "\Microsoft\Office\Office Automatic Updates"
+MsiExec.exe /X{90160000-007E-0000-1000-0000000FF1CE}
 
-schtasks.exe /delete /tn "\Microsoft\Office\Office Subscription Maintenance"
+MsiExec.exe /X{90160000-008C-0000-1000-0000000FF1CE}
 
-schtasks.exe /delete /tn "\Microsoft\Office\Office ClickToRun Service Monitor"
-
-schtasks.exe /delete /tn "\Microsoft\Office\OfficeTelemetryAgentLogOn2016"
-
-schtasks.exe /delete /tn "\Microsoft\Office\OfficeTelemetryAgentFallBack2016"
+MsiExec.exe /X{90160000-008C-0409-1000-0000000FF1CE}
