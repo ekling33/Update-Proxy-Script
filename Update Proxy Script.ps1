@@ -1,4 +1,4 @@
-# Disable JIMMYWILLOW on multiple VMs
+# Disable JIMMYWILLOW on multiple VMs - Fixed for all PowerShell versions
 # Usage: .\Disable-JIMMYWILLOW.ps1
 
 $AccountName = "JIMMYWILLOW"
@@ -35,7 +35,8 @@ foreach ($computer in $machines) {
             } -ArgumentList $AccountName -ErrorAction Stop
             
             $results += $result
-            Write-Host "✓ $computer`: $($result.Status)" -ForegroundColor Green
+            Write-Host "✓ $computer`: $($result.Status)"
+            
         } else {
             Write-Warning "✗ $computer`: Offline"
         }
@@ -48,4 +49,5 @@ foreach ($computer in $machines) {
 # Results summary
 $results | Format-Table -AutoSize
 $results | Export-Csv -Path "JIMMYWILLOW_Disabled_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv" -NoTypeInformation
-Write-Host "`n✅ Done! Check CSV. Re-scan in Qualys after verifying no service issues." -ForegroundColor Cyan
+
+Write-Host "`n✅ Done! Check CSV. Re-scan in Qualys after verifying no service issues."
