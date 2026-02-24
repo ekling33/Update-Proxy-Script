@@ -37,13 +37,13 @@ foreach ($Computer in $Computers) {
             param($ProgramName)
 
             $uninstallKeys = @(
-                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
             )
 
             $programs = foreach ($key in $uninstallKeys) {
                 if (Test-Path $key) {
-                    Get-ChildItem $key | Get-ItemProperty |
+                    Get-ItemProperty $key |
                         Where-Object { $_.DisplayName -like "*$ProgramName*" -and $_.UninstallString } |
                         Select-Object DisplayName, UninstallString
                 }
@@ -56,20 +56,14 @@ foreach ($Computer in $Computers) {
 
             foreach ($program in $programs) {
                 Write-Output "Found: $($program.DisplayName)"
-                $uninst = $program.UninstallString.Trim()
+                $uninst = $program.UninstallString.Trim('"')
 
                 # If it's an MSI-based uninstall, normalize /I to /X and add quiet flags
-                if ($uninst -match "MsiExec\.exe") {
-                    $uninst = $uninst -replace "/I", "/X"
-                    if ($uninst -notmatch "/quiet" -and $uninst -notmatch "/qn") {
-                        $uninst += " /quiet /qn"
-                    }
-                    if ($uninst -notmatch "/norestart") {
-                        $uninst += " /norestart"
-                    }
-
-                    Write-Output "Running MSI uninstall: $uninst"
-                    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $uninst" -Wait -PassThru
+                if ($uninst -match "^MsiExec\.exe\s*/I\s*[{[]?([A-F0-9]{8}-([A-F0-9]{4}-){3}[A-F0-9]{12})[}\]]?") {
+                    $productCode = $matches[1]
+                    $arguments = "/X `"$productCode`" /quiet /qn /norestart"
+                    Write-Output "Running MSI uninstall for product code $productCode"
+                    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru -NoNewWindow
                     Write-Output "Exit code: $($proc.ExitCode)"
                 }
                 else {
@@ -79,7 +73,7 @@ foreach ($Computer in $Computers) {
                     }
 
                     Write-Output "Running EXE uninstall: $uninst"
-                    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $uninst" -Wait -PassThru
+                    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$uninst`"" -Wait -PassThru -NoNewWindow
                     Write-Output "Exit code: $($proc.ExitCode)"
                 }
             }
@@ -88,7 +82,7 @@ foreach ($Computer in $Computers) {
         Invoke-Command -ComputerName $Computer -ScriptBlock $scriptBlock -ArgumentList $ProgramName -ErrorAction Stop
     }
     catch {
-        Write-Warning "Failed on $Computer: $($_.Exception.Message)"
+        Write-Warning "Failed on $Computer`: $($_.Exception.Message)"
     }
 
     Write-Host ""
