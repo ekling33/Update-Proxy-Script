@@ -1,51 +1,61 @@
-# Enable-ChromeUpdates.ps1 - Remote Chrome update fix for VMs
-# Run as Admin. Requires WinRM on targets.
+#Requires -RunAsAdministrator
+# machines.txt: one computer name per line (DNS name or IP). Lines starting with # are ignored.
 
-$machines = Get-Content -Path "machines.txt" | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() }
+$MachinesFile = Join-Path $PSScriptRoot 'machines.txt'
+$RegPath      = 'HKLM:\SOFTWARE\Policies\Google\Update'
 
-foreach ($machine in $machines) {
-    Write-Host "`nProcessing $machine..." -ForegroundColor Yellow
-    
-    try {
-        $session = New-PSSession -ComputerName $machine -ErrorAction Stop
-        
-        Invoke-Command -Session $session -ScriptBlock {
-            $regPaths = @(
-                "HKLM:\SOFTWARE\Policies\Google\Update",
-                "HKLM:\SOFTWARE\Wow6432Node\Policies\Google\Update"
-            )
-            
-            foreach ($path in $regPaths) {
-                if (Test-Path $path) {
-                    $blockingKeys = @(
-                        'UpdateDefault', 'AutoUpdateCheckPeriodMinutes', 'UpdatePolicy', 'DisableAutoUpdate',
-                        'RollbackToTargetVersion', 'TargetVersionPrefix', 'TargetChannel', 'Update',
-                        'TargetChannelOverride', 'TargetVersionPrefixOverride'
-                    )
-                    foreach ($key in $blockingKeys) {
-                        if (Get-ItemProperty -Path $path -Name $key -ErrorAction SilentlyContinue) {
-                            Remove-ItemProperty -Path $path -Name $key -Force
-                            Write-Output "Deleted $path\$key"
-                        }
-                    }
-                    New-ItemProperty -Path $path -Name 'UpdateDefault' -Value 1 -PropertyType DWord -Force | Out-Null
-                    Write-Output "Set $path\UpdateDefault=1"
-                }
-            }
-            
-            $services = @('gupdate', 'gupdatem')
-            foreach ($svc in $services) {
-                Restart-Service -Name $svc -Force -ErrorAction SilentlyContinue
-            }
-            Write-Output "Services restarted"
-        }
-        
-        Remove-PSSession $session
-        Write-Host "$machine : SUCCESS" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "$machine : FAILED - $($_.Exception.Message)" -ForegroundColor Red
-    }
+$RemoveValues = @(
+    'RollbackToTargetVersion{8A}',
+    'Update{8A}'
+)
+
+$SetDwordValues = @{
+    'DisableAutoUpdateChecksCheckboxValue' = 1
+    'AutoUpdateCheckPeriodMinutes'         = 90   # Note: correct policy name is AutoUpdateCheckPeriodMinutes
 }
 
-Write-Host "`nDone! Verify: chrome://policy/ on VMs." -ForegroundColor Cyan
+$Computers = Get-Content -Path $MachinesFile |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -and $_ -notmatch '^\s*#' } |
+    Sort-Object -Unique
+
+$Results = Invoke-Command -ComputerName $Computers -ErrorAction Continue -ScriptBlock {
+    param($RegPath, $RemoveValues, $SetDwordValues)
+
+    $out = [ordered]@{
+        ComputerName = $env:COMPUTERNAME
+        Status       = 'OK'
+        Details      = @()
+    }
+
+    try {
+        if (-not (Test-Path -Path $RegPath)) {
+            New-Item -Path $RegPath -Force | Out-Null
+            $out.Details += "Created key: $RegPath"
+        }
+
+        foreach ($name in $RemoveValues) {
+            if (Get-ItemProperty -Path $RegPath -Name $name -ErrorAction SilentlyContinue) {
+                Remove-ItemProperty -Path $RegPath -Name $name -Force
+                $out.Details += "Removed value: $name"
+            } else {
+                $out.Details += "Value not present (skip): $name"
+            }
+        }
+
+        foreach ($kvp in $SetDwordValues.GetEnumerator()) {
+            New-ItemProperty -Path $RegPath -Name $kvp.Key -Value ([int]$kvp.Value) -PropertyType DWord -Force | Out-Null
+            $out.Details += "Set DWORD: $($kvp.Key)=$($kvp.Value)"
+        }
+    }
+    catch {
+        $out.Status  = 'FAILED'
+        $out.Details += $_.Exception.Message
+    }
+
+    [pscustomobject]$out
+} -ArgumentList $RegPath, $RemoveValues, $SetDwordValues
+
+# Output to screen + CSV log
+$Results | Select-Object ComputerName, Status, @{n='Details';e={$_.Details -join '; '}} | Format-Table -AutoSize
+$Results | Export-Csv -NoTypeInformation -Path (Join-Path $PSScriptRoot 'RegistryUpdateResults.csv')
