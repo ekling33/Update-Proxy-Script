@@ -1,1 +1,1 @@
-$currentBuild = (Get-ComputerInfo).WindowsBuildLabEx.Split('.')[-1]; if ([int]$currentBuild -ge 4780) { Write-Output "Protected (build $currentBuild >= 4780)" } else { Write-Output "Check latest LCU" }
+(Get-ComputerInfo).WindowsBuildLabEx; (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuild
