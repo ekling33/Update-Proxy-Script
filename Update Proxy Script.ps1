@@ -1,1 +1,1 @@
-(Get-ComputerInfo).WindowsBuildLabEx; (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuild
+Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' | Select BuildLabEx, UBR, CurrentBuild
