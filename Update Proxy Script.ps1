@@ -1,4 +1,4 @@
-# Remote VM Cleanup Script
+# Remote VM Cleanup Script (Updated with Safe Windows Update Handling)
 # Run as Administrator with PS Remoting enabled on targets
 # Assumes machines.txt has one computername per line
 
@@ -13,7 +13,7 @@ foreach ($computer in $machines) {
             $before = (Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='$using:drive'" | Select-Object -ExpandProperty FreeSpace)
             
             # 1. Event Viewer Logs
-            Get-WinEvent -ListLog * | Where-Object {$_.RecordCount -gt 0} | ForEach-Object {Clear-EventLog $_.LogName -ErrorAction SilentlyContinue}
+            Get-WinEvent -ListLog * | Where-Object {$_.RecordCount -gt 0} | ForEach-Object {& "Clear-EventLog" $_.LogName -ErrorAction SilentlyContinue}
             
             # 2. System Log Files (general logs)
             Remove-Item "$env:SystemRoot\Logs\*.*" -Recurse -Force -ErrorAction SilentlyContinue
@@ -35,13 +35,25 @@ foreach ($computer in $machines) {
                 Remove-Item "$($_.FullName)\AppData\Local\Microsoft\Windows\WER\*" -Recurse -Force -ErrorAction SilentlyContinue
             }
             
-            # 7. Windows Update Logs
+            # 7. Windows Update Logs (moved before full cache clear)
             Remove-Item "$env:SystemRoot\SoftwareDistribution\Logs\*" -Recurse -Force -ErrorAction SilentlyContinue
             
-            # 16. Old Windows Update cache (full SD)
-            Stop-Service wuauserv, bits -Force -ErrorAction SilentlyContinue
+            # 16. Old Windows Update cache (timeout-safe)
+            $serviceNames = @('wuauserv', 'bits', 'cryptsvc')
+            foreach ($svc in $serviceNames) {
+                & sc.exe \\. stop $svc 2>$null
+                Start-Sleep -Seconds 5
+                $status = & sc.exe \\. query $svc 2>&1
+                if ($status -match 'STOPPED') { continue }
+                Get-WmiObject Win32_Service -Filter "Name='$svc'" | ForEach-Object {
+                    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+                Start-Sleep -Seconds 3
+            }
             Remove-Item "$env:SystemRoot\SoftwareDistribution\*" -Recurse -Force -ErrorAction SilentlyContinue
-            Start-Service wuauserv, bits -ErrorAction SilentlyContinue
+            foreach ($svc in $serviceNames) {
+                & sc.exe \\. start $svc 2>$null
+            }
             
             # 8. System Restore Points
             vssadmin delete shadows /all /quiet 2>$null
@@ -56,33 +68,37 @@ foreach ($computer in $machines) {
             }
             
             # 11. Recycle Bin all users
-            Get-ChildItem "C:\`$Recycle.Bin" -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem "C:\`$Recycle.Bin" -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
             
             # 12. IE Cache all users
             Get-ChildItem "C:\Users\*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
                 $iePaths = @(
-                    "$($_.FullName)\AppData\Local\Microsoft\Windows\INetCache",
-                    "$($_.FullName)\AppData\Local\Microsoft\Windows\Temporary Internet Files"
+                    "$($_.FullName)\AppData\Local\Microsoft\Windows\INetCache\*",
+                    "$($_.FullName)\AppData\Local\Microsoft\Windows\Temporary Internet Files\*"
                 )
-                $iePaths | ForEach-Object { Remove-Item $_\* -Recurse -Force -ErrorAction SilentlyContinue }
+                $iePaths | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
             }
             
-            # 13. Edge Cache all users (both classic and new)
+            # 13. Edge Cache all users
             Get-ChildItem "C:\Users\*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
                 $edgePaths = @(
-                    "$($_.FullName)\AppData\Local\Microsoft\Edge\User Data\Default\Cache",
-                    "$($_.FullName)\AppData\Local\Packages\Microsoft.MicrosoftEdge_* \AC\MicrosoftEdge\Cache\*",
-                    "$($_.FullName)\AppData\Local\Packages\Microsoft.MicrosoftEdge_* \AC\#!001\MicrosoftEdge\Cache\*"
+                    "$($_.FullName)\AppData\Local\Microsoft\Edge\User Data\Default\Cache\*",
+                    "$($_.FullName)\AppData\Local\Packages\Microsoft.MicrosoftEdge_*\AC\MicrosoftEdge\Cache\*",
+                    "$($_.FullName)\AppData\Local\Packages\Microsoft.MicrosoftEdge_*\AC\#!001\MicrosoftEdge\Cache\*"
                 )
                 $edgePaths | ForEach-Object { 
-                    if (Test-Path $_) { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path ($_ -replace '\\\*$', '')) { 
+                        Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue 
+                    }
                 }
             }
             
             # 14. Chrome Cache all users
             Get-ChildItem "C:\Users\*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-                $chromePath = "$($_.FullName)\AppData\Local\Google\Chrome\User Data\Default\Cache"
-                Remove-Item $chromePath\* -Recurse -Force -ErrorAction SilentlyContinue
+                $chromePath = "$($_.FullName)\AppData\Local\Google\Chrome\User Data\Default\Cache\*"
+                if (Test-Path ($chromePath -replace '\\\*$', '')) {
+                    Remove-Item $chromePath -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
             
             # 15. Temp folders all profiles
@@ -92,14 +108,15 @@ foreach ($computer in $machines) {
             
             # 17. CCMCache using COM
             try {
-                $CCM = New-Object -ComObject UIResource.UIResourceMgr
-                $CacheInfo = $CCM.GetCacheInfo().GetCacheElements()
-                foreach ($CacheItem in $CacheInfo) {
-                    $CCM.GetCacheInfo().DeleteCacheElement($CacheItem.CacheElementID)
+                $CCM = [WmiClass]"\\.\root\ccm:CCM_SoftwareDistribution"
+                $Cache = Get-WmiObject -Namespace root\ccm -Class CCM_Cache 2>$null
+                if ($Cache) {
+                    foreach ($Element in $Cache.GetCacheElements().Elements) {
+                        $Cache.DeleteCacheElement($Element.CacheElementID) | Out-Null
+                    }
                 }
-                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($CCM) | Out-Null
             } catch {
-                # Ignore if no SCCM
+                # Ignore if no SCCM client
             }
             
             # 18. .ost files all profiles
@@ -121,9 +138,8 @@ foreach ($computer in $machines) {
             $freedGB = [math]::Round(($after - $before) / 1GB, 2)
             Write-Output "Space freed on $env:COMPUTERNAME`: $freedGB GB"
         } -ErrorAction Stop
-        Write-Host "Completed $computer successfully." -ForegroundColor Green
+        Write-Host "Completed $computer successfully.`n" -ForegroundColor Green
     } catch {
-        Write-Host "Failed to process $computer`: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Failed $computer`: $($_.Exception.Message)`n" -ForegroundColor Red
     }
-    Write-Host ""
 }
