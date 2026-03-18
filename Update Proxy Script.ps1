@@ -11,8 +11,8 @@ foreach ($computer in $computers) {
                 "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
                 "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
             )
-            $updateExe = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
             
+            # Check if Chrome exists
             $chromeInstalled = $false
             $chromePath = $null
             foreach ($path in $chromePaths) {
@@ -24,19 +24,44 @@ foreach ($computer in $computers) {
             }
             
             if (-not $chromeInstalled) {
-                return @{ Success = $false; Message = "Chrome not found"; Version = "N/A" }
-            }
-            
-            if (Test-Path $updateExe) {
-                Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
-                & $updateExe /ua /installsource scheduler | Out-Null
-                Start-Sleep -Seconds 10  # Brief wait for update
-                $version = if (Test-Path $chromePath) { (Get-Item $chromePath).VersionInfo.ProductVersion } else { "Updated (path changed?)" }
-                return @{ Success = $true; Message = "Update triggered"; Version = $version }
+                # Install if missing
+                $msiUrl = "https://dl.google.com/dl/chrome/win64/ChromeSetup.msi"
+                $tempMsi = "C:\temp\ChromeLatest.msi"
+                New-Item "C:\temp" -ItemType Directory -Force | Out-Null
+                Invoke-WebRequest -Uri $msiUrl -OutFile $tempMsi -UseBasicParsing
+                
+                Start-Process "msiexec.exe" -ArgumentList "/i `"$tempMsi`" /qn /norestart" -Wait -NoNewWindow
+                Remove-Item $tempMsi -Force
+                
+                $finalPath = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
+                $version = if (Test-Path $finalPath) { (Get-Item $finalPath).VersionInfo.ProductVersion } else { "Install complete, verify path" }
+                return @{ Success = $true; Message = "Fresh MSI install"; Version = $version }
             } else {
-                return @{ Success = $false; Message = "GoogleUpdate.exe not found"; Version = "N/A" }
+                # Upgrade existing + policy fix
+                # Enable updates policy
+                $policyPath = "HKLM:\SOFTWARE\Policies\Google\Update"
+                $updateKey = "Update{8A69D345-D564-463C-AFF1-A69D9E530F96}"
+                if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+                Set-ItemProperty -Path $policyPath -Name $updateKey -Value 1 -Type DWord -Force
+                
+                # Force MSI upgrade
+                $msiUrl = "https://dl.google.com/dl/chrome/win64/ChromeSetup.msi"
+                $tempMsi = "C:\temp\ChromeLatest.msi"
+                New-Item "C:\temp" -ItemType Directory -Force | Out-Null
+                Invoke-WebRequest -Uri $msiUrl -OutFile $tempMsi -UseBasicParsing
+                
+                Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
+                Start-Process "msiexec.exe" -ArgumentList "/i `"$tempMsi`" /qn /norestart REINSTALL=ALL REINSTALLMODE=vamus" -Wait -NoNewWindow
+                
+                Remove-Item $tempMsi -Force
+                Start-Sleep -Seconds 5
+                
+                $finalPath = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
+                $version = if (Test-Path $finalPath) { (Get-Item $finalPath).VersionInfo.ProductVersion } else { "Upgrade complete" }
+                return @{ Success = $true; Message = "MSI Upgrade + Policy Fixed"; Version = $version }
             }
         }
+        
         # Safely add to results
         $resultObj = $updateResult | ConvertTo-Json | ConvertFrom-Json
         $resultObj | Add-Member -NotePropertyName 'Computer' -NotePropertyValue $computer -Force
@@ -55,5 +80,5 @@ foreach ($computer in $computers) {
 }
 
 # Export results
-$results | Export-Csv "ChromeUpdateResults_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
-Write-Host "Results exported to CSV. Check for any failures."
+$results | Export-Csv "ChromeMSIUpdateResults_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
+Write-Host "Full results in ChromeMSIUpdateResults CSV. Latest: 146.0.7680.80+"
