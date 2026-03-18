@@ -1,10 +1,10 @@
 # Load machines list
 $computers = Get-Content "C:\path\to\machines.txt" | Where-Object { $_ -match '\S' }
 
-# Credentials (prompts once or use stored)
+# Credentials
 $cred = Get-Credential -Message "Enter domain admin credentials"
 
-# Results log
+# Results array
 $results = @()
 
 foreach ($computer in $computers) {
@@ -18,7 +18,11 @@ foreach ($computer in $computers) {
             
             $chromeInstalled = $false
             foreach ($path in $chromePaths) {
-                if (Test-Path $path) { $chromeInstalled = $true; break }
+                if (Test-Path $path) { 
+                    $chromeInstalled = $true
+                    $chromePath = $path
+                    break 
+                }
             }
             
             if (-not $chromeInstalled) {
@@ -27,21 +31,30 @@ foreach ($computer in $computers) {
             
             if (Test-Path $updateExe) {
                 Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
-                Start-Process -FilePath $updateExe -ArgumentList "/ua /installsource scheduler" -Wait -NoNewWindow -ErrorAction Stop
-                $version = (Get-Item $chromePaths[0]).VersionInfo.ProductVersion
-                return @{ Success = $true; Message = "Updated"; Version = $version }
+                & $updateExe /ua /installsource scheduler | Out-Null
+                $version = if (Test-Path $chromePath) { (Get-Item $chromePath).VersionInfo.ProductVersion } else { "N/A" }
+                return @{ Success = $true; Message = "Update triggered"; Version = $version }
             } else {
                 return @{ Success = $false; Message = "GoogleUpdate.exe not found"; Version = "N/A" }
             }
         }
-        $results += [PSCustomObject]@{ Computer = $computer; $($updateResult) }
-        Write-Host "Success on $computer`: $($updateResult.Message) $($updateResult.Version)"
+        # Convert hashtable to object and add to results
+        $resultObj = $updateResult | ConvertTo-Json | ConvertFrom-Json | Select Computer, Success, Message, Version
+        $resultObj.Computer = $computer
+        $results += $resultObj
+        Write-Host "Success on $computer`: $($updateResult.Message) - Version: $($updateResult.Version)"
     }
     catch {
-        $results += [PSCustomObject]@{ Computer = $computer; Success = $false; Message = $_.Exception.Message; Version = "N/A" }
+        $results += [PSCustomObject]@{
+            Computer = $computer
+            Success = $false
+            Message = $_.Exception.Message
+            Version = "N/A"
+        }
         Write-Warning "Failed on $computer`: $($_.Exception.Message)"
     }
 }
 
 # Export results
 $results | Export-Csv "ChromeUpdateResults_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
+Write-Host "Results exported to CSV."
