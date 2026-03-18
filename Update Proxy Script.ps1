@@ -1,41 +1,47 @@
-# Remote Program Scan Script
-# Assumes WinRM/PSRemoting enabled on targets; run as admin.
+# Load machines list
+$computers = Get-Content "C:\path\to\machines.txt" | Where-Object { $_ -match '\S' }
 
-# Prompt for program name
-$programName = Read-Host "Enter the program name to search for (e.g., 'Notepad++')"
+# Credentials (prompts once or use stored)
+$cred = Get-Credential -Message "Enter domain admin credentials"
 
-# Read VM list from machines.txt (one hostname per line)
-$machines = Get-Content -Path "machines.txt" | Where-Object { $_.Trim() -ne "" }
+# Results log
+$results = @()
 
-Write-Host "Scanning $($machines.Count) VMs for '$programName'..." -ForegroundColor Green
-
-foreach ($machine in $machines) {
-    Write-Host "`n--- Scanning $machine ---" -ForegroundColor Yellow
-    
+foreach ($computer in $computers) {
     try {
-        $result = Invoke-Command -ComputerName $machine -ScriptBlock {
-            param($prog)
-            $keys = @(
-                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        $updateResult = Invoke-Command -ComputerName $computer -Credential $cred -ScriptBlock {
+            $chromePaths = @(
+                "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
+                "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
             )
-            $found = $false
-            foreach ($key in $keys) {
-                $apps = Get-ItemProperty $key -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -like "*$prog*" }
-                if ($apps) {
-                    $found = $true
-                    $apps | Select-Object DisplayName, DisplayVersion, Publisher | Format-Table -AutoSize
-                }
+            $updateExe = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
+            
+            $chromeInstalled = $false
+            foreach ($path in $chromePaths) {
+                if (Test-Path $path) { $chromeInstalled = $true; break }
             }
-            if (-not $found) { "Program '$prog' not found." }
-        } -ArgumentList $programName -ErrorAction Stop
-        
-        $result
+            
+            if (-not $chromeInstalled) {
+                return @{ Success = $false; Message = "Chrome not found"; Version = "N/A" }
+            }
+            
+            if (Test-Path $updateExe) {
+                Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
+                Start-Process -FilePath $updateExe -ArgumentList "/ua /installsource scheduler" -Wait -NoNewWindow -ErrorAction Stop
+                $version = (Get-Item $chromePaths[0]).VersionInfo.ProductVersion
+                return @{ Success = $true; Message = "Updated"; Version = $version }
+            } else {
+                return @{ Success = $false; Message = "GoogleUpdate.exe not found"; Version = "N/A" }
+            }
+        }
+        $results += [PSCustomObject]@{ Computer = $computer; $($updateResult) }
+        Write-Host "Success on $computer`: $($updateResult.Message) $($updateResult.Version)"
     }
     catch {
-        Write-Host "ERROR: Failed to connect/query $machine ($_)" -ForegroundColor Red
+        $results += [PSCustomObject]@{ Computer = $computer; Success = $false; Message = $_.Exception.Message; Version = "N/A" }
+        Write-Warning "Failed on $computer`: $($_.Exception.Message)"
     }
 }
 
-Write-Host "`nScan complete!" -ForegroundColor Green
+# Export results
+$results | Export-Csv "ChromeUpdateResults_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
