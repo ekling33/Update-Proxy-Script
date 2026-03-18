@@ -1,15 +1,12 @@
 # Load machines list
 $computers = Get-Content "C:\path\to\machines.txt" | Where-Object { $_ -match '\S' }
 
-# Credentials
-$cred = Get-Credential -Message "Enter domain admin credentials"
-
 # Results array
 $results = @()
 
 foreach ($computer in $computers) {
     try {
-        $updateResult = Invoke-Command -ComputerName $computer -Credential $cred -ScriptBlock {
+        $updateResult = Invoke-Command -ComputerName $computer -ScriptBlock {
             $chromePaths = @(
                 "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
                 "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
@@ -17,6 +14,7 @@ foreach ($computer in $computers) {
             $updateExe = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
             
             $chromeInstalled = $false
+            $chromePath = $null
             foreach ($path in $chromePaths) {
                 if (Test-Path $path) { 
                     $chromeInstalled = $true
@@ -32,15 +30,16 @@ foreach ($computer in $computers) {
             if (Test-Path $updateExe) {
                 Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
                 & $updateExe /ua /installsource scheduler | Out-Null
-                $version = if (Test-Path $chromePath) { (Get-Item $chromePath).VersionInfo.ProductVersion } else { "N/A" }
+                Start-Sleep -Seconds 10  # Brief wait for update
+                $version = if (Test-Path $chromePath) { (Get-Item $chromePath).VersionInfo.ProductVersion } else { "Updated (path changed?)" }
                 return @{ Success = $true; Message = "Update triggered"; Version = $version }
             } else {
                 return @{ Success = $false; Message = "GoogleUpdate.exe not found"; Version = "N/A" }
             }
         }
-        # Convert hashtable to object and add to results
-        $resultObj = $updateResult | ConvertTo-Json | ConvertFrom-Json | Select Computer, Success, Message, Version
-        $resultObj.Computer = $computer
+        # Safely add to results
+        $resultObj = $updateResult | ConvertTo-Json | ConvertFrom-Json
+        $resultObj | Add-Member -NotePropertyName 'Computer' -NotePropertyValue $computer -Force
         $results += $resultObj
         Write-Host "Success on $computer`: $($updateResult.Message) - Version: $($updateResult.Version)"
     }
@@ -57,4 +56,4 @@ foreach ($computer in $computers) {
 
 # Export results
 $results | Export-Csv "ChromeUpdateResults_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
-Write-Host "Results exported to CSV."
+Write-Host "Results exported to CSV. Check for any failures."
