@@ -1,12 +1,20 @@
 # ===== CHROME ENTERPRISE UPGRADE - SINGLE SCRIPT =====
-# RUN AS ADMIN. UPDATE THIS PATH:
+# RUN AS ADMIN. UPDATE THIS PATH and $adminMachine:
 $machinesPath = "C:\path\to\machines.txt"
+$adminMachine = "YOUR-ADMIN-MACHINE-NAME"  # e.g., "DC01" or "192.168.1.10"
 
 # Local MSI cache folder
 $localShare = "C:\ChromeShare"
 
 if (-not (Test-Path $localShare)) {
     New-Item $localShare -ItemType Directory -Force | Out-Null
+}
+
+# Create SMB share for remote access
+$shareName = "ChromeShare"
+if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
+    New-SmbShare -Name $shareName -Path $localShare -FullAccess "Everyone" -ErrorAction Stop
+    Write-Host "Created SMB share: \\$adminMachine\ChromeShare"
 }
 
 $x64Msi = Join-Path $localShare "ChromeEnterprise64.msi"
@@ -36,7 +44,10 @@ if (-not (Test-Path $machinesPath)) {
 }
 
 $computers = Get-Content $machinesPath | Where-Object { $_ -match '\S' }
-$results   = @()
+$results = @()
+
+$x64Unc = "\\$adminMachine\ChromeShare\ChromeEnterprise64.msi"
+$x86Unc = "\\$adminMachine\ChromeShare\ChromeEnterprise.msi"
 
 foreach ($computer in $computers) {
     try {
@@ -47,7 +58,7 @@ foreach ($computer in $computers) {
             )
 
             $x64Path = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-            $x86Path = "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
+            $x86Path = "`"$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe`""
 
             $currentVersion = $null
             $currentVersionString = $null
@@ -74,7 +85,6 @@ foreach ($computer in $computers) {
                 $centralMsi = $x86MsiRemote
             }
             else {
-                # No Chrome: install x64
                 $arch = "none→64-bit"
                 $centralMsi = $x64MsiRemote
             }
@@ -139,7 +149,7 @@ foreach ($computer in $computers) {
                 Arch    = $arch
             }
 
-        } -ArgumentList $x64Msi, $x86Msi
+        } -ArgumentList $x64Unc, $x86Unc
 
         # Back on admin machine – collect result
         $obj = $updateResult | ConvertTo-Json | ConvertFrom-Json
