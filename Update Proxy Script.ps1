@@ -1,110 +1,166 @@
-# ===== SINGLE SCRIPT: Chrome Enterprise Upgrade =====
-# Creates C:\ChromeShare with latest MSIs, deploys to machines.txt
-
-# Config - UPDATE PATHS
+# ===== CHROME ENTERPRISE UPGRADE - SINGLE SCRIPT =====
+# RUN AS ADMIN. UPDATE THIS PATH:
 $machinesPath = "C:\path\to\machines.txt"
+
+# Local MSI cache folder
 $localShare = "C:\ChromeShare"
 
-# Step 1: Setup share + download MSIs (idempotent)
-if (-not (Test-Path $localShare)) { New-Item $localShare -ItemType Directory -Force | Out-Null }
-$x64Msi = "$localShare\ChromeEnterprise64.msi"
-$x86Msi = "$localShare\ChromeEnterprise.msi"
+if (-not (Test-Path $localShare)) {
+    New-Item $localShare -ItemType Directory -Force | Out-Null
+}
 
+$x64Msi = Join-Path $localShare "ChromeEnterprise64.msi"
+$x86Msi = Join-Path $localShare "ChromeEnterprise.msi"
+
+# Download x64 MSI if missing/small
 if (-not (Test-Path $x64Msi) -or ((Get-Item $x64Msi).Length -lt 100MB)) {
-    Write-Host "Downloading x64 MSI..."
-    Invoke-WebRequest "https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise64.msi" -OutFile $x64Msi
+    Write-Host "Downloading Chrome x64 Enterprise MSI..."
+    Invoke-WebRequest `
+        -Uri "https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise64.msi" `
+        -OutFile $x64Msi
 }
+
+# Download x86 MSI if missing/small
 if (-not (Test-Path $x86Msi) -or ((Get-Item $x86Msi).Length -lt 100MB)) {
-    Write-Host "Downloading x86 MSI..."
-    Invoke-WebRequest "https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise.msi" -OutFile $x86Msi
+    Write-Host "Downloading Chrome x86 Enterprise MSI..."
+    Invoke-WebRequest `
+        -Uri "https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise.msi" `
+        -OutFile $x86Msi
 }
 
-Write-Host "MSIs ready: x64=$((Get-Item $x64Msi).Length/1MB)MB, x86=$((Get-Item $x86Msi).Length/1MB)MB"
+Write-Host "x64 MSI size: $([math]::Round((Get-Item $x64Msi).Length/1MB,1)) MB"
+Write-Host "x86 MSI size: $([math]::Round((Get-Item $x86Msi).Length/1MB,1)) MB"
 
-# Step 2: Load targets
-if (-not (Test-Path $machinesPath)) { throw "machines.txt not found: $machinesPath" }
+if (-not (Test-Path $machinesPath)) {
+    throw "machines.txt not found: $machinesPath"
+}
+
 $computers = Get-Content $machinesPath | Where-Object { $_ -match '\S' }
-
-$results = @()
+$results   = @()
 
 foreach ($computer in $computers) {
     try {
         $updateResult = Invoke-Command -ComputerName $computer -ScriptBlock {
-            param($x64MsiLocal, $x86MsiLocal)
-            
-            $x64Path = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
-            $x86Path = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-            
-            # Detect current
+            param(
+                [string]$x64MsiRemote,
+                [string]$x86MsiRemote
+            )
+
+            $x64Path = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+            $x86Path = "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
+
             $currentVersion = $null
+            $currentVersionString = $null
             $arch = $null
-            $targetMsi = $null
-            
+            $centralMsi = $null
+
+            # Detect installed Chrome + architecture
             if (Test-Path $x64Path) {
-                $verStr = (Get-Item $x64Path).VersionInfo.ProductVersion
-                $currentVersion = [version]($verStr -split '\.' | Select -First 3 -join '.')
+                $currentVersionString = (Get-Item $x64Path).VersionInfo.ProductVersion
+                $parts = $currentVersionString.Split('.')
+                if ($parts.Count -ge 3) {
+                    $currentVersion = [version]::Parse(($parts[0..2] -join '.'))
+                }
                 $arch = "64-bit"
-                $targetMsi = $x64MsiLocal
-            } elseif (Test-Path $x86Path) {
-                $verStr = (Get-Item $x86Path).VersionInfo.ProductVersion
-                $currentVersion = [version]($verStr -split '\.' | Select -First 3 -join '.')
+                $centralMsi = $x64MsiRemote
+            }
+            elseif (Test-Path $x86Path) {
+                $currentVersionString = (Get-Item $x86Path).VersionInfo.ProductVersion
+                $parts = $currentVersionString.Split('.')
+                if ($parts.Count -ge 3) {
+                    $currentVersion = [version]::Parse(($parts[0..2] -join '.'))
+                }
                 $arch = "32-bit"
-                $targetMsi = $x86MsiLocal
+                $centralMsi = $x86MsiRemote
             }
-            
-            # Already latest?
+            else {
+                # No Chrome: install x64
+                $arch = "none→64-bit"
+                $centralMsi = $x64MsiRemote
+            }
+
+            # If already 146 or higher, skip
             if ($currentVersion -and $currentVersion.Major -ge 146) {
-                return @{ Success = $true; Message = "Latest $arch v$currentVersion"; Version = $verStr; Arch = $arch }
+                return @{
+                    Success = $true
+                    Message = "Already latest $arch $currentVersionString"
+                    Version = $currentVersionString
+                    Arch    = $arch
+                }
             }
-            
-            # Verify MSI
-            if (-not (Test-Path $targetMsi)) {
-                return @{ Success = $false; Message = "MSI not found: $targetMsi"; Version = $currentVersion; Arch = $arch }
+
+            if (-not (Test-Path $centralMsi)) {
+                return @{
+                    Success = $false
+                    Message = "MSI not found: $centralMsi"
+                    Version = $currentVersionString
+                    Arch    = $arch
+                }
             }
-            
-            # Policy fix
+
+            # Enable update policy
             $policyPath = "HKLM:\SOFTWARE\Policies\Google\Update"
-            New-Item $policyPath -Force | Out-Null -ErrorAction SilentlyContinue
-            Set-ItemProperty $policyPath "Update{8A69D345-D564-463C-AFF1-A69D9E530F96}" 1 -Type DWord -Force
-            
-            # Deploy
+            New-Item $policyPath -Force -ErrorAction SilentlyContinue | Out-Null
+            Set-ItemProperty `
+                -Path $policyPath `
+                -Name "Update{8A69D345-D564-463C-AFF1-A69D9E530F96}" `
+                -Value 1 -Type DWord -Force
+
+            # Copy MSI locally and install
             $localMsi = "C:\temp\Chrome_$arch.msi"
             New-Item "C:\temp" -ItemType Directory -Force | Out-Null
-            Copy-Item $targetMsi $localMsi -Force
-            
-            Stop-Process "chrome" -Force -ErrorAction SilentlyContinue
+            Copy-Item $centralMsi $localMsi -Force
+
+            Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
+
             $msiArgs = "/i `"$localMsi`" /qn /norestart REINSTALL=ALL REINSTALLMODE=vamus"
-            $proc = Start-Process "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
-            
+            $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+
             Remove-Item $localMsi -Force -ErrorAction SilentlyContinue
-            Start-Sleep 3
-            
-            if ($proc.ExitCode -ne 0) { throw "MSI exit code: $($proc.ExitCode)" }
-            
-            $newVerPath = if ($arch -eq "64-bit") { $x64Path } else { $x86Path }
-            $newVersion = if (Test-Path $newVerPath) { (Get-Item $newVerPath).VersionInfo.ProductVersion } else { "Deployed 146.x" }
-            
-            return @{ Success = $true; Message = "$arch → Latest 146.x"; Version = $newVersion; Arch = $arch }
+            Start-Sleep -Seconds 3
+
+            if ($proc.ExitCode -ne 0) {
+                throw "MSI exit code: $($proc.ExitCode)"
+            }
+
+            # Read new version
+            $finalPath = if (Test-Path $x64Path) { $x64Path } elseif (Test-Path $x86Path) { $x86Path } else { $null }
+            $newVerString = $null
+            if ($finalPath) {
+                $newVerString = (Get-Item $finalPath).VersionInfo.ProductVersion
+            } else {
+                $newVerString = "Installed/updated - check manually"
+            }
+
+            return @{
+                Success = $true
+                Message = "Upgraded $arch → latest"
+                Version = $newVerString
+                Arch    = $arch
+            }
+
         } -ArgumentList $x64Msi, $x86Msi
-        
-        $resultObj = $updateResult | ConvertTo-Json | ConvertFrom-Json
-        $resultObj | Add-Member -NotePropertyName 'Computer' -NotePropertyValue $computer -Force
-        $results += $resultObj
-        Write-Host "$computer`: $($updateResult.Success) - $($updateResult.Message) [$($updateResult.Arch)]"
+
+        # Back on admin machine – collect result
+        $obj = $updateResult | ConvertTo-Json | ConvertFrom-Json
+        $obj | Add-Member -NotePropertyName 'Computer' -NotePropertyValue $computer -Force
+        $results += $obj
+
+        Write-Host "$computer : $($obj.Success) - $($obj.Message) [$($obj.Arch)]"
     }
     catch {
         $results += [PSCustomObject]@{
             Computer = $computer
-            Success = $false
-            Message = $_.Exception.Message
-            Version = "N/A"
-            Arch = "Error"
+            Success  = $false
+            Message  = $_.Exception.Message
+            Version  = "N/A"
+            Arch     = "Error"
         }
-        Write-Warning "FAIL $computer`: $($_.Exception.Message)"
+        Write-Warning "FAIL $computer : $($_.Exception.Message)"
     }
 }
 
-# Export
-$csvName = "ChromeComplete_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
-$results | Export-Csv $csvName -NoTypeInformation
-Write-Host "Complete! Results: $csvName | MSIs cached: $localShare | Latest: 146.0.7680.154+"
+# Export summary
+$csvName = "Chrome_Upgrade_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
+$results | Export-Csv -Path $csvName -NoTypeInformation
+Write-Host "Done. Results saved to $csvName"
