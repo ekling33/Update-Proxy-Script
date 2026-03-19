@@ -1,10 +1,17 @@
-# Update Chrome Enterprise on remote machines from machines.txt
-# Requires PSRemoting enabled on targets (Enable-PSRemoting -Force)
+# Update Chrome Enterprise on remote machines from machines.txt (proxy + auth)
+# Prompts for proxy creds ONCE, caches for all VMs
 
+# Get proxy credentials ONCE (no repeat prompts)
+$proxyCred = Get-Credential -Message "Enter proxy credentials for proxy.jimmy.com:8080 (domain\user or user)"
+if (-not $proxyCred) { Write-Error "No proxy credentials provided. Exiting."; exit 1 }
+
+$proxyUri = "http://proxy.jimmy.com:8080"
 $machines = Get-Content .\machines.txt | Where-Object { $_ -match '\S' }
 
 $scriptBlock = {
-    # Embedded update logic (same as before)
+    param($proxyUri, $proxyCred)
+    
+    # Close Chrome
     Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Write-Host "[$env:COMPUTERNAME] Closed Chrome processes."
 
@@ -18,13 +25,13 @@ $scriptBlock = {
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
     try {
-        Write-Host "[$env:COMPUTERNAME] Downloading MSI..."
-        Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath
+        Write-Host "[$env:COMPUTERNAME] Downloading MSI via proxy..."
+        Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -Proxy $proxyUri -ProxyCredential $proxyCred
         Write-Host "[$env:COMPUTERNAME] Downloaded."
 
         Write-Host "[$env:COMPUTERNAME] Installing..."
         Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -NoNewWindow
-        Write-Host "[$env:COMPUTERNAME] Chrome updated."
+        Write-Host "[$env:COMPUTERNAME] Chrome updated successfully."
     } catch {
         Write-Error "[$env:COMPUTERNAME] Error: $($_.Exception.Message)"
     } finally {
@@ -32,7 +39,8 @@ $scriptBlock = {
     }
 }
 
-# Run on all machines (parallel by default, throttles to 32)
-Invoke-Command -ComputerName $machines -ScriptBlock $scriptBlock -AsJob | Wait-Job | Receive-Job
+# Run on all machines (creds cached, passed once per VM)
+Write-Host "Starting updates on $($machines.Count) machines..."
+Invoke-Command -ComputerName $machines -ScriptBlock $scriptBlock -ArgumentList $proxyUri, $proxyCred -AsJob | Wait-Job | Receive-Job
 
 Write-Host "All updates complete."
