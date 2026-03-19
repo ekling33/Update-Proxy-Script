@@ -1,46 +1,20 @@
-# Update Chrome Enterprise on remote machines from machines.txt (proxy + auth)
-# Prompts for proxy creds ONCE, caches for all VMs
+# VM ID (hostname/IP for labeling)
+$VMID = $env:COMPUTERNAME
 
-# Get proxy credentials ONCE (no repeat prompts)
-$proxyCred = Get-Credential -Message "Enter proxy credentials for proxy.jimmy.com:8080 (domain\user or user)"
-if (-not $proxyCred) { Write-Error "No proxy credentials provided. Exiting."; exit 1 }
+# 1. NetBIOS config per adapter (0/1=enabled exposes users, 2=disabled)
+Get-NetIPConfiguration | Select-Object InterfaceAlias, IPv4Address, @{N='NetBIOS';E={if ((Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\$($_.InterfaceIndex)" -EA SilentlyContinue).NetbiosOptions -eq 2) {'Disabled'} else {'Enabled'}}}
 
-$proxyUri = "http://proxy.jimmy.com:8080"
-$machines = Get-Content .\machines.txt | Where-Object { $_ -match '\S' }
+# 2. Listening ports (NetBIOS/SMB/SNMP triggers)
+netstat -an | Select-String ":137 :138 :139 :445 :161"
 
-$scriptBlock = {
-    param($proxyUri, $proxyCred)
-    
-    # Close Chrome
-    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Write-Host "[$env:COMPUTERNAME] Closed Chrome processes."
+# 3. Firewall rules for key ports (Enabled=block?)
+netsh advfirewall firewall show rule name=all | Select-String "137|138|139|445|161"
 
-    $is64Bit = [Environment]::Is64BitOperatingSystem
-    $msiUrl64 = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi"
-    $msiUrl32 = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise.msi"
-    $msiUrl = if ($is64Bit) { $msiUrl64 } else { $msiUrl32 }
-    $tempDir = "$env:TEMP\ChromeUpdate"
-    $msiPath = "$tempDir\ChromeEnterprise.msi"
+# 4. Local users (enumerated list)
+net user
 
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+# 5. Services exposing info (running?)
+Get-Service | Where-Object {$_.Name -match "LanmanServer|SNMP|NetBT"}
 
-    try {
-        Write-Host "[$env:COMPUTERNAME] Downloading MSI via proxy..."
-        Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -Proxy $proxyUri -ProxyCredential $proxyCred
-        Write-Host "[$env:COMPUTERNAME] Downloaded."
-
-        Write-Host "[$env:COMPUTERNAME] Installing..."
-        Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -NoNewWindow
-        Write-Host "[$env:COMPUTERNAME] Chrome updated successfully."
-    } catch {
-        Write-Error "[$env:COMPUTERNAME] Error: $($_.Exception.Message)"
-    } finally {
-        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# Run on all machines (creds cached, passed once per VM)
-Write-Host "Starting updates on $($machines.Count) machines..."
-Invoke-Command -ComputerName $machines -ScriptBlock $scriptBlock -ArgumentList $proxyUri, $proxyCred -AsJob | Wait-Job | Receive-Job
-
-Write-Host "All updates complete."
+# Output labeled file
+$_ | Out-File "C:\temp\$VMID_QID45002_check.txt"
