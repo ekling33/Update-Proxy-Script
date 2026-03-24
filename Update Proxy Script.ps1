@@ -1,20 +1,62 @@
-# VM ID (hostname/IP for labeling)
-$VMID = $env:COMPUTERNAME
+# Run as Administrator
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Error "Run as Administrator"
+    exit 1
+}
 
-# 1. NetBIOS config per adapter (0/1=enabled exposes users, 2=disabled)
-Get-NetIPConfiguration | Select-Object InterfaceAlias, IPv4Address, @{N='NetBIOS';E={if ((Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\$($_.InterfaceIndex)" -EA SilentlyContinue).NetbiosOptions -eq 2) {'Disabled'} else {'Enabled'}}}
+# 1. Clean C:\Windows\CCMCache
+$ccmPath = "C:\Windows\CCMCache"
+if (Test-Path $ccmPath) {
+    Get-ChildItem -Path $ccmPath -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Output "Cleaned CCMCache"
+}
 
-# 2. Listening ports (NetBIOS/SMB/SNMP triggers)
-netstat -an | Select-String ":137 :138 :139 :445 :161"
+# 2. Clean C:\Windows\Temp
+$tempPath = "C:\Windows\Temp"
+Get-ChildItem -Path $tempPath -Recurse -Force | Remove-Item -Force -ErrorAction SilentlyContinue
+Write-Output "Cleaned Windows Temp"
 
-# 3. Firewall rules for key ports (Enabled=block?)
-netsh advfirewall firewall show rule name=all | Select-String "137|138|139|445|161"
+# 3. Clean Outlook .nst and .ost files for all users
+$users = Get-ChildItem "C:\Users" -Directory
+foreach ($user in $users) {
+    if ($user.Name -eq "Public" -or $user.Name -eq "Default") { continue }
+    $outlookPath = Join-Path $user.FullName "\AppData\Local\Microsoft\Outlook"
+    if (Test-Path $outlookPath) {
+        Get-ChildItem -Path $outlookPath -Filter "*.nst" -Recurse -Force | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $outlookPath -Filter "*.ost" -Recurse -Force | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Output "Cleaned Outlook files for $($user.Name)"
+    }
+}
 
-# 4. Local users (enumerated list)
-net user
+# 4. Clears all event viewer logs
+Get-WinEvent -ListLog * | Where-Object { $_.RecordCount -gt 0 } | ForEach-Object {
+    try {
+        wevtutil cl $_.LogName
+        Write-Output "Cleared $($_.LogName)"
+    } catch {
+        Write-Warning "Failed to clear $($_.LogName): $_"
+    }
+}
 
-# 5. Services exposing info (running?)
-Get-Service | Where-Object {$_.Name -match "LanmanServer|SNMP|NetBT"}
+# 5. Cleans all users' recycle bin and temp files
+$shell = New-Object -ComObject Shell.Application
+$recycleBin = $shell.Namespace(0xA)
+$recycleBin.Items() | ForEach-Object { $_.InvokeVerb("Delete") }
+Write-Output "Cleared Recycle Bin (current user)"
 
-# Output labeled file
-$_ | Out-File "C:\temp\$VMID_QID45002_check.txt"
+# Clear user temp files for all users
+foreach ($user in $users) {
+    if ($user.Name -eq "Public" -or $user.Name -eq "Default") { continue }
+    $tempDirs = @(
+        Join-Path $user.FullName "AppData\Local\Temp",
+        Join-Path $user.FullName "AppData\Roaming\Microsoft\Windows\Recent"
+    )
+    foreach ($dir in $tempDirs) {
+        if (Test-Path $dir) {
+            Get-ChildItem -Path $dir -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Output "Cleaned temp files for $($user.Name)"
+}
+
+Write-Output "Cleanup complete."
