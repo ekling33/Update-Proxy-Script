@@ -28,7 +28,7 @@ foreach ($user in $users) {
     }
 }
 
-# 4. Clears all event viewer logs
+# 4. Clear all Event Viewer logs
 Get-WinEvent -ListLog * | Where-Object { $_.RecordCount -gt 0 } | ForEach-Object {
     try {
         wevtutil cl $_.LogName
@@ -38,20 +38,17 @@ Get-WinEvent -ListLog * | Where-Object { $_.RecordCount -gt 0 } | ForEach-Object
     }
 }
 
-# 5. Cleans all users' recycle bin and temp files
-$shell = New-Object -ComObject Shell.Application
-$recycleBin = $shell.Namespace(0xA)
-$recycleBin.Items() | ForEach-Object { $_.InvokeVerb("Delete") }
-Write-Output "Cleared Recycle Bin (current user)"
+# 5a. Clear Recycle Bin (system-wide)
+Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+Write-Output "Cleared Recycle Bin"
 
-# Clear user temp files for all users
+# 5b. Clear user temp files for all users
 foreach ($user in $users) {
     if ($user.Name -eq "Public" -or $user.Name -eq "Default") { continue }
-    $tempDirs = @(
-        Join-Path $user.FullName "AppData\Local\Temp",
-        Join-Path $user.FullName "AppData\Roaming\Microsoft\Windows\Recent"
-    )
-    foreach ($dir in $tempDirs) {
+    $localTemp = Join-Path $user.FullName "AppData\Local\Temp"
+    $recent = Join-Path $user.FullName "AppData\Roaming\Microsoft\Windows\Recent"
+    $temps = @($localTemp, $recent)
+    foreach ($dir in $temps) {
         if (Test-Path $dir) {
             Get-ChildItem -Path $dir -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         }
