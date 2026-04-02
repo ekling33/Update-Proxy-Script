@@ -1,2 +1,2 @@
-# On GOOD server
-Get-TlsCipherSuite | Select-Object -ExpandProperty Name | Out-File "GoodCiphers.txt"
+# GOOD server
+Get-TlsCipherSuite | ForEach-Object { $_.Name } | Out-File "GoodCiphers.txt"
