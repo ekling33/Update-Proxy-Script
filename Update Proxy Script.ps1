@@ -1,8 +1,8 @@
-# List all certs in Personal store with thumbprint, subject, expiry
-Get-ChildItem Cert:\LocalMachine\My | 
-  Select-Object Thumbprint, Subject, NotAfter, Issuer |
-  Sort-Object NotAfter |
+# Find Blue Prism services and their accounts
+Get-WmiObject Win32_Service | Where-Object Name -like "*Blue Prism*" | 
+  Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
   Format-Table -AutoSize
 
-# Export cert list to file for comparison
-Get-ChildItem Cert:\LocalMachine\My | Export-Clixml "C:\BP_Certs_$env:COMPUTERNAME.xml"
+# Detailed service config
+sc qc "Blue Prism Server"
+sc qc "BPService Default"  # or whatever the exact service name is
