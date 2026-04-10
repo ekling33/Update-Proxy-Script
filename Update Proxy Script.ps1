@@ -1,62 +1,138 @@
-# PatchWinREScript_2004plus.ps1
-# This script is for Windows 10, version 2004 and later versions, including Windows 11.
 param(
-    [string]$workDir = $env:TEMP,
-    [Parameter(Mandatory=$true)]
-    [string]$packagePath
+    [string]$workDir = "C:\Temp\WinREPatch",
+    [string]$packagePath = ""
 )
 
-# Check if running as admin
-if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "Must run as administrator."
-    exit 1
+$ErrorActionPreference = "Stop"
+
+function Write-Log {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "[$ts] $Message"
 }
 
-# Get WinRE info
-$reagentInfo = reagentc /info
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "reagentc /info failed."
-    exit 1
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-if ($reagentInfo -match "Windows RE status: *Enabled") {
-    # Disable WinRE
-    reagentc /disable
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "reagentc /disable failed."
-        exit 1
+function Run-Cmd {
+    param(
+        [string]$FilePath,
+        [string]$Arguments
+    )
+    Write-Log "$FilePath $Arguments"
+    $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -ne 0) {
+        throw "Command failed with exit code $($p.ExitCode): $FilePath $Arguments"
     }
 }
 
-# Find WinRE.wim
-$winrePartition = $null
-$winreMountDir = "$workDir\WinREMountDir"
-if (!(Test-Path $winreMountDir)) {
-    New-Item -Path $winreMountDir -ItemType Directory -Force | Out-Null
+if (-not (Test-Admin)) {
+    throw "Run this script in an elevated PowerShell session."
 }
 
-$winreWimPath = reagentc /info | Select-String "Windows RE image location:" | ForEach-Object { $_.Line -replace ".*:\s+", "" }
-if ([string]::IsNullOrEmpty($winreWimPath)) {
-    Write-Error "WinRE image location not found."
-    exit 1
+if (-not (Test-Path $workDir)) {
+    New-Item -Path $workDir -ItemType Directory -Force | Out-Null
 }
 
-# Mount WinRE
-Write-Host "Mounting WinRE image at $winreWimPath to $winreMountDir"
-Dism /Mount-Image /ImageFile:$winreWimPath /index:1 /MountDir:$winreMountDir /readonly:no
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Mount failed."
-    exit 1
+$mountDir = Join-Path $workDir "Mount"
+if (-not (Test-Path $mountDir)) {
+    New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
 }
 
-# Apply package
-Write-Host "Applying package $packagePath"
-Dism /Add-Package /Image:$winreMountDir /PackagePath:$packagePath
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Add-Package failed."
-    Dism /Unmount-Image /MountDir:$winreMountDir /Discard
-    exit 1
+Write-Log "Getting WinRE configuration"
+$reagentInfo = & reagentc /info 2>&1
+$reagentText = $reagentInfo | Out-String
+$reagentText | Write-Host
+
+if ($reagentText -notmatch "Windows RE status:\s+Enabled") {
+    Write-Log "WinRE is not enabled. Attempting to enable it."
+    & reagentc /enable
+    $reagentInfo = & reagentc /info 2>&1
+    $reagentText = $reagentInfo | Out-String
 }
 
-# Commit
-Dism
+if ($reagentText -notmatch "Windows RE location:\s+(.*)") {
+    throw "Could not determine Windows RE location from reagentc /info"
+}
+
+$winreLocation = $matches[1].Trim()
+Write-Log "WinRE location: $winreLocation"
+
+$normalizedPath = $winreLocation -replace '^\\\\\?\\GLOBALROOT\\device\\harddisk\d+\\partition\d+', ''
+if ([string]::IsNullOrWhiteSpace($normalizedPath)) {
+    $normalizedPath = "\Recovery\WindowsRE"
+}
+
+$localCandidates = @(
+    "C:\Recovery\WindowsRE\winre.wim",
+    "$env:SystemRoot\System32\Recovery\winre.wim"
+)
+
+$winreWim = $null
+foreach ($candidate in $localCandidates) {
+    if (Test-Path $candidate) {
+        $winreWim = $candidate
+        break
+    }
+}
+
+if (-not $winreWim) {
+    Write-Log "Could not directly access WinRE path from GLOBALROOT reference."
+    Write-Log "Trying common local WinRE paths."
+}
+
+if (-not $winreWim) {
+    throw "Could not find winre.wim in common paths. Check reagentc /info and recovery partition."
+}
+
+Write-Log "Using WinRE image: $winreWim"
+
+Write-Log "Disabling WinRE"
+& reagentc /disable | Out-Host
+
+Write-Log "Mounting WinRE image"
+Run-Cmd -FilePath "dism.exe" -Arguments "/Mount-Image /ImageFile:`"$winreWim`" /Index:1 /MountDir:`"$mountDir`""
+
+if (-not [string]::IsNullOrWhiteSpace($packagePath)) {
+    if (-not (Test-Path $packagePath)) {
+        Write-Log "Package path provided but file not found: $packagePath"
+        Write-Log "Continuing without package."
+    }
+    else {
+        Write-Log "Applying package: $packagePath"
+        Run-Cmd -FilePath "dism.exe" -Arguments "/Image:`"$mountDir`" /Add-Package /PackagePath:`"$packagePath`""
+    }
+}
+else {
+    Write-Log "No packagePath provided. Skipping Add-Package step."
+}
+
+Write-Log "Running component cleanup"
+try {
+    Run-Cmd -FilePath "dism.exe" -Arguments "/Image:`"$mountDir`" /Cleanup-Image /StartComponentCleanup"
+}
+catch {
+    Write-Log "Cleanup step failed or is not applicable. Continuing."
+}
+
+Write-Log "Committing and unmounting image"
+Run-Cmd -FilePath "dism.exe" -Arguments "/Unmount-Image /MountDir:`"$mountDir`" /Commit"
+
+Write-Log "Re-enabling WinRE"
+& reagentc /enable | Out-Host
+
+Write-Log "Final WinRE status"
+& reagentc /info | Out-Host
+
+Write-Log "Checking WinREVersion registry value"
+try {
+    reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v WinREVersion
+}
+catch {
+    Write-Log "WinREVersion registry value is still missing."
+}
+
+Write-Log "Script completed"
