@@ -1,81 +1,14 @@
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-color 1F
+.mdb / .accdb Access files
+→ Migrate the data to SQL Server and change Blue Prism connections from Microsoft.Jet.OLEDB.4.0 / Microsoft.ACE.OLEDB.12.0 to a SQL‑based provider (e.g., SQL Server Native Client / ODBC).
 
-echo ==================================================
-echo Microsoft Defender / Windows Update Repair Script
-echo ==================================================
-echo.
-echo This script must be run as Administrator.
-echo.
+Excel files read via ACE
+→ Stop using Microsoft.ACE.OLEDB for Excel and instead read Excel via Blue Prism Excel VBO / .NET libraries (e.g., EPPlus / ClosedXML) or 64‑bit ODBC drivers.
 
-net session >nul 2>&1
-if not %errorlevel%==0 (
-  echo [ERROR] Please right-click this file and choose Run as administrator.
-  echo.
-  pause
-  exit /b 1
-)
+CSV files read via ACE‑style “table”
+→ Replace the ACE‑based CSV connection with Blue Prism’s native CSV‑parsing actions or a .NET‑based CSV helper, then remove ACE‑2016‑based drivers.
 
-echo [1/8] Stopping update-related services...
-net stop wuauserv /y
-net stop cryptSvc /y
-net stop bits /y
-net stop msiserver /y
-net stop usosvc /y
+Legacy .mdb that must stay .mdb
+→ Keep the .mdb‑to‑ACE logic in a separate 32‑bit helper app (using ACE.OLEDB) and make Blue Prism talk to that app over API / SQL‑style endpoints instead of directly to the .mdb.
 
-echo.
-echo [2/8] Clearing Windows Update cache...
-if exist C:\Windows\SoftwareDistribution (
-  ren C:\Windows\SoftwareDistribution SoftwareDistribution.old.%random%
-)
-if exist C:\Windows\System32\catroot2 (
-  ren C:\Windows\System32\catroot2 catroot2.old.%random%
-)
-
-echo.
-echo [3/8] Resetting network/update stack...
-netsh winsock reset
-netsh winhttp reset proxy
-ipconfig /flushdns
-
-echo.
-echo [4/8] Starting services again...
-net start cryptSvc
-net start bits
-net start msiserver
-net start wuauserv
-net start usosvc
-
-echo.
-echo [5/8] Running system file checks...
-sfc /scannow
-DISM /Online /Cleanup-Image /RestoreHealth
-
-echo.
-echo [6/8] Trying Defender signature update...
-if exist "%ProgramFiles%\Windows Defender\MpCmdRun.exe" (
-  "%ProgramFiles%\Windows Defender\MpCmdRun.exe" -SignatureUpdate
-) else if exist "%ProgramData%\Microsoft\Windows Defender\Platform" (
-  for /f "delims=" %%I in ('dir /b /ad /o-n "%ProgramData%\Microsoft\Windows Defender\Platform"') do (
-    if exist "%ProgramData%\Microsoft\Windows Defender\Platform\%%I\MpCmdRun.exe" (
-      "%ProgramData%\Microsoft\Windows Defender\Platform\%%I\MpCmdRun.exe" -SignatureUpdate
-      goto :afterupdate
-    )
-  )
-)
-:afterupdate
-
-echo.
-echo [7/8] Opening Windows Security update page...
-start windowsdefender:
-
-echo.
-echo [8/8] Cleanup note:
-echo Old update cache folders were renamed, not deleted.
-echo You can remove the old SoftwareDistribution.old.* and catroot2.old.* folders later after confirming updates work.
-echo.
-echo Script completed. A reboot is strongly recommended before testing again.
-echo.
-pause
-endlocal
+Mixed datasets (.mdb/Excel/CSV)
+→ For all mixed‑data teams, remove any Microsoft.Jet.OLEDB.4.0 / ACE.OLEDB.12.0‑based connections, migrate data to SQL where possible, and route everything through SQL‑based, ODBC‑based, or API‑based Blue Prism connections.
