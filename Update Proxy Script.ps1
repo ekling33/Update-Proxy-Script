@@ -1,6 +1,5 @@
 $machineListPath = ".\machines.txt"
 $outputCsv = ".\DefenderDefinitionStatus.csv"
-$updateUrl = "https://www.microsoft.com/wdsi/defenderupdates"
 
 if (-not (Test-Path $machineListPath)) {
     throw "machines.txt not found at $machineListPath"
@@ -12,82 +11,64 @@ if (-not $computers) {
     throw "machines.txt is empty"
 }
 
-try {
-    $latestPage = Invoke-WebRequest -Uri $updateUrl -UseBasicParsing -ErrorAction Stop
-    $latestVersion = [regex]::Match($latestPage.Content, 'Version:\s*([0-9\.]+)').Groups[1].Value
-
-    if (-not $latestVersion) {
-        throw "Could not determine latest Defender intelligence version from Microsoft."
-    }
-}
-catch {
-    throw "Failed to retrieve latest Defender version from Microsoft. $($_.Exception.Message)"
-}
-
-Write-Host "Latest Microsoft Defender intelligence version: $latestVersion" -ForegroundColor Cyan
-
 $results = foreach ($computer in $computers) {
-    $session = $null
-
     try {
-        $session = New-CimSession -ComputerName $computer -ErrorAction Stop
-        $status = Get-MpComputerStatus -CimSession $session -ErrorAction Stop
+        $result = Invoke-Command -ComputerName $computer -ScriptBlock {
+            try {
+                Import-Module Defender -ErrorAction SilentlyContinue
 
-        $installedVersion = $status.AntivirusSignatureVersion
-        $lastUpdated = $status.AntivirusSignatureLastUpdated
-        $sigOutOfDate = $status.DefenderSignaturesOutOfDate
-        $avEnabled = $status.AntivirusEnabled
-        $rtEnabled = $status.RealTimeProtectionEnabled
+                $status = Get-MpComputerStatus -ErrorAction Stop
 
-        try {
-            $installed = [version]$installedVersion
-            $latest = [version]$latestVersion
+                if (-not $status.AntivirusEnabled) {
+                    $state = "Antivirus Disabled"
+                }
+                elseif ($status.DefenderSignaturesOutOfDate) {
+                    $state = "Outdated"
+                }
+                else {
+                    $state = "Current"
+                }
 
-            if (-not $avEnabled) {
-                $state = "Antivirus Disabled"
+                [pscustomobject]@{
+                    ComputerName                = $env:COMPUTERNAME
+                    Status                      = $state
+                    InstalledSignatureVersion   = $status.AntivirusSignatureVersion
+                    SignatureLastUpdated        = $status.AntivirusSignatureLastUpdated
+                    DefenderSignaturesOutOfDate = $status.DefenderSignaturesOutOfDate
+                    AntivirusEnabled            = $status.AntivirusEnabled
+                    RealTimeProtectionEnabled   = $status.RealTimeProtectionEnabled
+                    AMRunningMode               = $status.AMRunningMode
+                    Error                       = $null
+                }
             }
-            elseif ($installed -eq $latest) {
-                $state = "Current"
+            catch {
+                [pscustomobject]@{
+                    ComputerName                = $env:COMPUTERNAME
+                    Status                      = "Check Failed"
+                    InstalledSignatureVersion   = $null
+                    SignatureLastUpdated        = $null
+                    DefenderSignaturesOutOfDate = $null
+                    AntivirusEnabled            = $null
+                    RealTimeProtectionEnabled   = $null
+                    AMRunningMode               = $null
+                    Error                       = $_.Exception.Message
+                }
             }
-            elseif ($installed -lt $latest) {
-                $state = "Outdated"
-            }
-            else {
-                $state = "Newer than published"
-            }
-        }
-        catch {
-            $state = "Could not compare versions"
-        }
+        } -ErrorAction Stop
 
-        [pscustomobject]@{
-            ComputerName                = $computer
-            Status                      = $state
-            InstalledSignatureVersion   = $installedVersion
-            LatestMicrosoftVersion      = $latestVersion
-            SignatureLastUpdated        = $lastUpdated
-            DefenderSignaturesOutOfDate = $sigOutOfDate
-            AntivirusEnabled            = $avEnabled
-            RealTimeProtectionEnabled   = $rtEnabled
-            Error                       = $null
-        }
+        $result
     }
     catch {
         [pscustomobject]@{
             ComputerName                = $computer
             Status                      = "Unreachable/Failed"
             InstalledSignatureVersion   = $null
-            LatestMicrosoftVersion      = $latestVersion
             SignatureLastUpdated        = $null
             DefenderSignaturesOutOfDate = $null
             AntivirusEnabled            = $null
             RealTimeProtectionEnabled   = $null
+            AMRunningMode               = $null
             Error                       = $_.Exception.Message
-        }
-    }
-    finally {
-        if ($session) {
-            Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
         }
     }
 }
