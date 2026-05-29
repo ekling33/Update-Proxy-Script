@@ -30,14 +30,13 @@ $results = foreach ($computer in $computers) {
             }
 
             [pscustomobject]@{
-                ComputerName                = $env:COMPUTERNAME
-                Status                      = $state
-                InstalledSignatureVersion   = $status.AntivirusSignatureVersion
-                SignatureLastUpdated        = $status.AntivirusSignatureLastUpdated
-                DefenderSignaturesOutOfDate = $status.DefenderSignaturesOutOfDate
-                AntivirusEnabled            = $status.AntivirusEnabled
-                RealTimeProtectionEnabled   = $status.RealTimeProtectionEnabled
-                Error                       = $null
+                ComputerName              = $env:COMPUTERNAME
+                Status                    = $state
+                DefinitionVersion         = $status.AntivirusSignatureVersion
+                DefinitionsUpdateTime     = $status.AntivirusSignatureLastUpdated
+                AntivirusEnabled          = $status.AntivirusEnabled
+                RealTimeProtectionEnabled = $status.RealTimeProtectionEnabled
+                Error                     = $null
             }
         } -ErrorAction Stop
 
@@ -45,14 +44,13 @@ $results = foreach ($computer in $computers) {
     }
     catch {
         [pscustomobject]@{
-            ComputerName                = $computer
-            Status                      = 'Unreachable/Failed'
-            InstalledSignatureVersion   = $null
-            SignatureLastUpdated        = $null
-            DefenderSignaturesOutOfDate = $null
-            AntivirusEnabled            = $null
-            RealTimeProtectionEnabled   = $null
-            Error                       = $_.Exception.Message
+            ComputerName              = $computer
+            Status                    = 'Unreachable/Failed'
+            DefinitionVersion         = $null
+            DefinitionsUpdateTime     = $null
+            AntivirusEnabled          = $null
+            RealTimeProtectionEnabled = $null
+            Error                     = $_.Exception.Message
         }
     }
 }
