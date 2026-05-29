@@ -1,5 +1,5 @@
 $machineListPath = '.\machines.txt'
-$outputCsv = '.\DefenderDefinitionStatus.csv'
+$outputCsv = '.\DefenderAMProductVersion.csv'
 
 if (-not (Test-Path $machineListPath)) {
     Write-Error 'machines.txt not found'
@@ -19,24 +19,14 @@ $results = foreach ($computer in $computers) {
             Import-Module Defender -ErrorAction SilentlyContinue
             $status = Get-MpComputerStatus
 
-            if (-not $status.AntivirusEnabled) {
-                $state = 'Antivirus Disabled'
-            }
-            elseif ($status.DefenderSignaturesOutOfDate) {
-                $state = 'Outdated'
-            }
-            else {
-                $state = 'Current'
-            }
-
             [pscustomobject]@{
-                ComputerName              = $env:COMPUTERNAME
-                Status                    = $state
-                DefinitionVersion         = $status.AntivirusSignatureVersion
-                DefinitionsUpdateTime     = $status.AntivirusSignatureLastUpdated
-                AntivirusEnabled          = $status.AntivirusEnabled
+                ComputerName        = $env:COMPUTERNAME
+                AMProductVersion    = $status.AMProductVersion
+                AMEngineVersion     = $status.AMEngineVersion
+                AntivirusSignatureVersion = $status.AntivirusSignatureVersion
+                AntivirusEnabled    = $status.AntivirusEnabled
                 RealTimeProtectionEnabled = $status.RealTimeProtectionEnabled
-                Error                     = $null
+                Error               = $null
             }
         } -ErrorAction Stop
 
@@ -44,13 +34,13 @@ $results = foreach ($computer in $computers) {
     }
     catch {
         [pscustomobject]@{
-            ComputerName              = $computer
-            Status                    = 'Unreachable/Failed'
-            DefinitionVersion         = $null
-            DefinitionsUpdateTime     = $null
-            AntivirusEnabled          = $null
+            ComputerName        = $computer
+            AMProductVersion    = $null
+            AMEngineVersion     = $null
+            AntivirusSignatureVersion = $null
+            AntivirusEnabled    = $null
             RealTimeProtectionEnabled = $null
-            Error                     = $_.Exception.Message
+            Error               = $_.Exception.Message
         }
     }
 }
