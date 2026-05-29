@@ -1,58 +1,43 @@
-$machineListPath = ".\machines.txt"
-$outputCsv = ".\DefenderDefinitionStatus.csv"
+$machineListPath = '.\machines.txt'
+$outputCsv = '.\DefenderDefinitionStatus.csv'
 
 if (-not (Test-Path $machineListPath)) {
-    throw "machines.txt not found at $machineListPath"
+    Write-Error 'machines.txt not found'
+    exit 1
 }
 
-$computers = Get-Content $machineListPath | Where-Object { $_.Trim() -ne "" }
+$computers = Get-Content $machineListPath | Where-Object { $_.Trim() -ne '' }
 
 if (-not $computers) {
-    throw "machines.txt is empty"
+    Write-Error 'machines.txt is empty'
+    exit 1
 }
 
 $results = foreach ($computer in $computers) {
     try {
         $result = Invoke-Command -ComputerName $computer -ScriptBlock {
-            try {
-                Import-Module Defender -ErrorAction SilentlyContinue
+            Import-Module Defender -ErrorAction SilentlyContinue
+            $status = Get-MpComputerStatus
 
-                $status = Get-MpComputerStatus -ErrorAction Stop
-
-                if (-not $status.AntivirusEnabled) {
-                    $state = "Antivirus Disabled"
-                }
-                elseif ($status.DefenderSignaturesOutOfDate) {
-                    $state = "Outdated"
-                }
-                else {
-                    $state = "Current"
-                }
-
-                [pscustomobject]@{
-                    ComputerName                = $env:COMPUTERNAME
-                    Status                      = $state
-                    InstalledSignatureVersion   = $status.AntivirusSignatureVersion
-                    SignatureLastUpdated        = $status.AntivirusSignatureLastUpdated
-                    DefenderSignaturesOutOfDate = $status.DefenderSignaturesOutOfDate
-                    AntivirusEnabled            = $status.AntivirusEnabled
-                    RealTimeProtectionEnabled   = $status.RealTimeProtectionEnabled
-                    AMRunningMode               = $status.AMRunningMode
-                    Error                       = $null
-                }
+            if (-not $status.AntivirusEnabled) {
+                $state = 'Antivirus Disabled'
             }
-            catch {
-                [pscustomobject]@{
-                    ComputerName                = $env:COMPUTERNAME
-                    Status                      = "Check Failed"
-                    InstalledSignatureVersion   = $null
-                    SignatureLastUpdated        = $null
-                    DefenderSignaturesOutOfDate = $null
-                    AntivirusEnabled            = $null
-                    RealTimeProtectionEnabled   = $null
-                    AMRunningMode               = $null
-                    Error                       = $_.Exception.Message
-                }
+            elseif ($status.DefenderSignaturesOutOfDate) {
+                $state = 'Outdated'
+            }
+            else {
+                $state = 'Current'
+            }
+
+            [pscustomobject]@{
+                ComputerName                = $env:COMPUTERNAME
+                Status                      = $state
+                InstalledSignatureVersion   = $status.AntivirusSignatureVersion
+                SignatureLastUpdated        = $status.AntivirusSignatureLastUpdated
+                DefenderSignaturesOutOfDate = $status.DefenderSignaturesOutOfDate
+                AntivirusEnabled            = $status.AntivirusEnabled
+                RealTimeProtectionEnabled   = $status.RealTimeProtectionEnabled
+                Error                       = $null
             }
         } -ErrorAction Stop
 
@@ -61,20 +46,19 @@ $results = foreach ($computer in $computers) {
     catch {
         [pscustomobject]@{
             ComputerName                = $computer
-            Status                      = "Unreachable/Failed"
+            Status                      = 'Unreachable/Failed'
             InstalledSignatureVersion   = $null
             SignatureLastUpdated        = $null
             DefenderSignaturesOutOfDate = $null
             AntivirusEnabled            = $null
             RealTimeProtectionEnabled   = $null
-            AMRunningMode               = $null
             Error                       = $_.Exception.Message
         }
     }
 }
 
-$results | Sort-Object ComputerName | Format-Table -AutoSize
-$results | Sort-Object ComputerName | Export-Csv -Path $outputCsv -NoTypeInformation
+$results | Format-Table -AutoSize
+$results | Export-Csv -Path $outputCsv -NoTypeInformation
 
-Write-Host ""
+Write-Host ''
 Write-Host "Results exported to $outputCsv" -ForegroundColor Green
