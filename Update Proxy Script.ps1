@@ -1,11 +1,12 @@
 ##Step 1:
 
 # Create self-signed certificate
+# Create self-signed certificate (corrected syntax)
 $cert = New-SelfSignedCertificate `
   -DnsName $env:COMPUTERNAME, "localhost" `
   -CertStoreLocation "cert:\LocalMachine\My" `
   -KeyUsage DigitalSignature, KeyEncipherment `
-  -ExtentionList @("2.5.29.17") `
+  -Type SSLServerAuthentication `
   -NotAfter (Get-Date).AddYears(2)
 
   ##Step 2:
