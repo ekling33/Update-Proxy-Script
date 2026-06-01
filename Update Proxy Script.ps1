@@ -1,52 +1,22 @@
-$machineListPath = '.\machines.txt'
-$outputCsv = '.\DefenderAMProductVersion.csv'
+##Step 1:
 
-if (-not (Test-Path $machineListPath)) {
-    Write-Error 'machines.txt not found'
-    exit 1
-}
+# Create self-signed certificate
+$cert = New-SelfSignedCertificate `
+  -DnsName $env:COMPUTERNAME, "localhost" `
+  -CertStoreLocation "cert:\LocalMachine\My" `
+  -KeyUsage DigitalSignature, KeyEncipherment `
+  -ExtentionList @("2.5.29.17") `
+  -NotAfter (Get-Date).AddYears(2)
 
-$computers = Get-Content $machineListPath | Where-Object { $_.Trim() -ne '' }
+  ##Step 2:
+  # Add certificate to Trusted Root Certification Authorities
+$rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store `
+  -ArgumentList Root, LocalMachine
+$rootStore.Open("MaxAllowed")
+$rootStore.Add($cert)
+$rootStore.Close()
 
-if (-not $computers) {
-    Write-Error 'machines.txt is empty'
-    exit 1
-}
+##Step 3:
 
-$results = foreach ($computer in $computers) {
-    try {
-        $result = Invoke-Command -ComputerName $computer -ScriptBlock {
-            Import-Module Defender -ErrorAction SilentlyContinue
-            $status = Get-MpComputerStatus
-
-            [pscustomobject]@{
-                ComputerName        = $env:COMPUTERNAME
-                AMProductVersion    = $status.AMProductVersion
-                AMEngineVersion     = $status.AMEngineVersion
-                AntivirusSignatureVersion = $status.AntivirusSignatureVersion
-                AntivirusEnabled    = $status.AntivirusEnabled
-                RealTimeProtectionEnabled = $status.RealTimeProtectionEnabled
-                Error               = $null
-            }
-        } -ErrorAction Stop
-
-        $result
-    }
-    catch {
-        [pscustomobject]@{
-            ComputerName        = $computer
-            AMProductVersion    = $null
-            AMEngineVersion     = $null
-            AntivirusSignatureVersion = $null
-            AntivirusEnabled    = $null
-            RealTimeProtectionEnabled = $null
-            Error               = $_.Exception.Message
-        }
-    }
-}
-
-$results | Format-Table -AutoSize
-$results | Export-Csv -Path $outputCsv -NoTypeInformation
-
-Write-Host ''
-Write-Host "Results exported to $outputCsv" -ForegroundColor Green
+# Get the thumbprint (needed for Blue Prism configuration)
+$cert.Thumbprint
