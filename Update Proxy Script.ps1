@@ -1,9 +1,2 @@
-net stop wuauserv
-net stop cryptSvc
-net stop bits
-ren C:\Windows\SoftwareDistribution SoftwareDistribution.old
-ren C:\Windows\System32\catroot2 Catroot2.old
-net start wuauserv
-net start cryptSvc
-net start bits
-netsh winsock reset
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp" /v DefaultSecureProtocols /t REG_DWORD /d 0x00000C00 /f
+reg add "HKLM\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp" /v DefaultSecureProtocols /t REG_DWORD /d 0x00000C00 /f
