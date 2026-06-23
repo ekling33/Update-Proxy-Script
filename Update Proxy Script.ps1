@@ -1,41 +1,29 @@
-# Disable TLS 1.3 and enable strong crypto for .NET Framework
-# Run in an elevated PowerShell session
+$machines = Get-Content -Path ".\machines.txt"
 
-$ErrorActionPreference = 'Stop'
+$regPath = "HKLM:\SOFTWARE\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown"
+$valueName = "bUpdater"
+$valueData = 1
+$valueType = "DWord"
 
-Write-Host "Configuring TLS settings..." -ForegroundColor Cyan
+foreach ($machine in $machines) {
+    $machine = $machine.Trim()
+    if ([string]::IsNullOrWhiteSpace($machine)) { continue }
 
-$paths = @(
-    "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Client",
-    "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Server"
-)
+    Write-Host "Processing $machine..."
 
-foreach ($path in $paths) {
-    if (-not (Test-Path $path)) {
-        New-Item -Path $path -Force | Out-Null
+    try {
+        Invoke-Command -ComputerName $machine -ScriptBlock {
+            param($regPath, $valueName, $valueData)
+
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+
+            New-ItemProperty -Path $regPath -Name $valueName -Value $valueData -PropertyType DWord -Force | Out-Null
+            Write-Output "Updated $valueName to $valueData"
+        } -ArgumentList $regPath, $valueName, $valueData -ErrorAction Stop
     }
-
-    New-ItemProperty -Path $path -Name "Enabled" -Value 0 -PropertyType DWord -Force | Out-Null
-    New-ItemProperty -Path $path -Name "DisabledByDefault" -Value 1 -PropertyType DWord -Force | Out-Null
-}
-
-$dotNetPaths = @(
-    "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319",
-    "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319"
-)
-
-foreach ($path in $dotNetPaths) {
-    if (-not (Test-Path $path)) {
-        New-Item -Path $path -Force | Out-Null
+    catch {
+        Write-Warning "Failed on $machine : $($_.Exception.Message)"
     }
-
-    New-ItemProperty -Path $path -Name "SchUseStrongCrypto" -Value 1 -PropertyType DWord -Force | Out-Null
-    New-ItemProperty -Path $path -Name "SystemDefaultTlsVersions" -Value 1 -PropertyType DWord -Force | Out-Null
 }
-
-Write-Host ""
-Write-Host "Done." -ForegroundColor Green
-Write-Host "TLS 1.3 disabled for Schannel client/server." -ForegroundColor Yellow
-Write-Host ".NET Framework strong crypto enabled." -ForegroundColor Yellow
-Write-Host ""
-Write-Host "Reboot the VM before testing Blue Prism again." -ForegroundColor Cyan
