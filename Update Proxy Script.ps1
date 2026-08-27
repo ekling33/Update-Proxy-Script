@@ -1,4 +1,33 @@
 #requires -Version 5.1
+<#+
+.SYNOPSIS
+    Stops IIS, waits for confirmation, updates a prompted IIS app-pool identity password,
+    starts IIS, and reports the final status of every application pool.
+
+.DESCRIPTION
+    Run locally on an IIS server from an elevated Windows PowerShell 5.1 session.
+
+    The script prompts for an identity username and new password. It stops IIS by stopping
+    the World Wide Web Publishing Service (W3SVC) and Windows Process Activation Service (WAS),
+    pauses with an "IIS STOPPED. Press Enter to continue..." prompt, backs up
+    applicationHost.config, updates matching SpecificUser application pools, starts WAS and
+    W3SVC again, then reports the status of every IIS application pool.
+
+    The following pools are never modified:
+      - .NET v4.5
+      - .NET v4.5 Classic
+      - DefaultAppPool
+
+    Before stopping IIS, the script records which pools were running. After IIS starts, it
+    starts only the pools that were running before the outage. Pools that were already stopped
+    remain stopped.
+
+.EXAMPLE
+    .\Interact_AppPool_Password_Update.ps1 -WhatIf
+
+.EXAMPLE
+    .\Interact_AppPool_Password_Update.ps1
+#>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
@@ -7,8 +36,6 @@ param(
         '.NET v4.5 Classic',
         'DefaultAppPool'
     ),
-
-    [switch]$RecycleUpdatedPools,
 
     [switch]$SkipConfigBackup
 )
@@ -19,10 +46,7 @@ $ErrorActionPreference = 'Stop'
 function Test-IsAdministrator {
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-
-    return $currentPrincipal.IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator
-    )
+    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function ConvertTo-PlainText {
@@ -32,17 +56,75 @@ function ConvertTo-PlainText {
     )
 
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-
     try {
-        [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
     }
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
 }
 
+function Wait-ServiceStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [System.ServiceProcess.ServiceControllerStatus]$DesiredStatus,
+
+        [int]$TimeoutSeconds = 90
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    do {
+        $service = Get-Service -Name $Name
+        $service.Refresh()
+
+        if ($service.Status -eq $DesiredStatus) {
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+    while ((Get-Date) -lt $deadline)
+
+    throw "Service '$Name' did not reach '$DesiredStatus' within $TimeoutSeconds seconds. Current state: $($service.Status)."
+}
+
+function Show-AppPoolStatus {
+    Write-Host ''
+    Write-Host 'Final IIS application-pool status:' -ForegroundColor Cyan
+
+    $status = foreach ($pool in Get-ChildItem IIS:\AppPools | Sort-Object Name) {
+        $runtimeState = 'Unknown'
+
+        try {
+            $runtimeState = (Get-WebAppPoolState -Name $pool.Name).Value
+        }
+        catch {
+            $runtimeState = 'Unavailable'
+        }
+
+        [PSCustomObject]@{
+            Name         = $pool.Name
+            State        = $runtimeState
+            IdentityType = $pool.processModel.identityType
+            UserName     = $pool.processModel.userName
+        }
+    }
+
+    $status | Format-Table -AutoSize
+
+    Write-Host ''
+    Write-Host ("Summary: Started={0}; Stopped={1}; Other/Unavailable={2}" -f `
+        @($status | Where-Object State -eq 'Started').Count, `
+        @($status | Where-Object State -eq 'Stopped').Count, `
+        @($status | Where-Object { $_.State -notin @('Started', 'Stopped') }).Count) -ForegroundColor Cyan
+}
+
 if (-not (Test-IsAdministrator)) {
-    throw 'Run this script from an elevated Windows PowerShell session: Run as Administrator.'
+    throw 'Run this script from an elevated Windows PowerShell session (Run as Administrator).'
 }
 
 try {
@@ -53,113 +135,143 @@ catch {
 }
 
 $UserName = Read-Host 'Enter the IIS application-pool identity username (example: DOMAIN\svc_iis)'
-
 if ([string]::IsNullOrWhiteSpace($UserName)) {
     throw 'A username is required.'
 }
 
 $NewPassword = Read-Host 'Enter the new password' -AsSecureString
-
 if ($null -eq $NewPassword -or $NewPassword.Length -eq 0) {
     throw 'A non-empty password is required.'
 }
 
 $applicationHostConfig = Join-Path $env:WINDIR 'System32\inetsrv\config\applicationHost.config'
-
 if (-not (Test-Path -LiteralPath $applicationHostConfig)) {
     throw "IIS configuration was not found at: $applicationHostConfig"
 }
 
-if (-not $SkipConfigBackup) {
-    $backupDirectory = Join-Path `
-        (Split-Path -Parent $applicationHostConfig) `
-        'PasswordUpdateBackups'
-
-    if (-not (Test-Path -LiteralPath $backupDirectory)) {
-        New-Item -Path $backupDirectory -ItemType Directory -Force | Out-Null
+$targetPools = @(
+    Get-ChildItem IIS:\AppPools | Where-Object {
+        $_.Name -notin $ExcludeAppPools -and
+        $_.processModel.identityType -eq 'SpecificUser' -and
+        $_.processModel.userName -ieq $UserName
     }
+)
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $backupFile = Join-Path `
-        $backupDirectory `
-        "applicationHost.config.$timestamp.bak"
-
-    if ($PSCmdlet.ShouldProcess(
-        $applicationHostConfig,
-        "Create backup at $backupFile"
-    )) {
-        Copy-Item `
-            -LiteralPath $applicationHostConfig `
-            -Destination $backupFile `
-            -Force
-
-        Write-Host "Created IIS configuration backup: $backupFile" -ForegroundColor Cyan
-    }
+if ($targetPools.Count -eq 0) {
+    Write-Warning "No non-excluded application pools using '$UserName' were found. No changes were made."
+    return
 }
 
+Write-Host ''
+Write-Host "Matching application pools for '$UserName':" -ForegroundColor Cyan
+$targetPools | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+$runningPoolsBeforeStop = @(
+    Get-ChildItem IIS:\AppPools | Where-Object {
+        (Get-WebAppPoolState -Name $_.Name).Value -eq 'Started'
+    } | Select-Object -ExpandProperty Name
+)
+
+Write-Host ''
+Write-Host "Application pools running before IIS is stopped: $($runningPoolsBeforeStop.Count)" -ForegroundColor Cyan
+
 $plainTextPassword = ConvertTo-PlainText -SecureString $NewPassword
-$updatedPools = @()
+$iisStopped = $false
 
 try {
-    $targetPools = @(
-        Get-ChildItem IIS:\AppPools | Where-Object {
-            $_.Name -notin $ExcludeAppPools -and
-            $_.processModel.identityType -eq 'SpecificUser' -and
-            $_.processModel.userName -ieq $UserName
+    if (-not $SkipConfigBackup) {
+        $backupDirectory = Join-Path (Split-Path -Parent $applicationHostConfig) 'PasswordUpdateBackups'
+        if (-not (Test-Path -LiteralPath $backupDirectory)) {
+            if ($PSCmdlet.ShouldProcess($backupDirectory, 'Create directory')) {
+                New-Item -Path $backupDirectory -ItemType Directory -Force | Out-Null
+            }
         }
-    )
 
-    if ($targetPools.Count -eq 0) {
-        Write-Warning "No non-excluded application pools using '$UserName' were found. No changes were made."
-        return
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $backupFile = Join-Path $backupDirectory "applicationHost.config.$timestamp.bak"
+
+        if ($PSCmdlet.ShouldProcess($applicationHostConfig, "Create backup at $backupFile")) {
+            Copy-Item -LiteralPath $applicationHostConfig -Destination $backupFile -Force
+            Write-Host "Created IIS configuration backup: $backupFile" -ForegroundColor Cyan
+        }
     }
 
-    Write-Host ""
-    Write-Host "Matching application pools for '$UserName':" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('IIS services (W3SVC and WAS)', 'Stop IIS before updating application-pool passwords')) {
+        Write-Host ''
+        Write-Host 'Stopping IIS services...' -ForegroundColor Yellow
 
-    foreach ($pool in $targetPools) {
-        Write-Host "  - $($pool.Name)"
+        $w3svc = Get-Service -Name W3SVC
+        if ($w3svc.Status -ne 'Stopped') {
+            Stop-Service -Name W3SVC -Force
+            Wait-ServiceStatus -Name W3SVC -DesiredStatus Stopped
+        }
+
+        $was = Get-Service -Name WAS
+        if ($was.Status -ne 'Stopped') {
+            Stop-Service -Name WAS -Force
+            Wait-ServiceStatus -Name WAS -DesiredStatus Stopped
+        }
+
+        $iisStopped = $true
+        Write-Host ''
+        Write-Host 'IIS STOPPED. Press Enter to continue...' -ForegroundColor Yellow
+        [void](Read-Host)
     }
-
-    Write-Host ""
 
     foreach ($pool in $targetPools) {
         $poolName = $pool.Name
         $poolPath = "IIS:\AppPools\$poolName"
 
-        if ($PSCmdlet.ShouldProcess(
-            "IIS application pool '$poolName'",
-            "Update password for '$UserName'"
-        )) {
-            Set-ItemProperty `
-                -Path $poolPath `
-                -Name 'processModel.password' `
-                -Value $plainTextPassword
-
-            $updatedPools += $poolName
-
-            Write-Host "Updated: $poolName" -ForegroundColor Green
+        if ($PSCmdlet.ShouldProcess("IIS application pool '$poolName'", "Update password for '$UserName'")) {
+            Set-ItemProperty -Path $poolPath -Name 'processModel.password' -Value $plainTextPassword
+            Write-Host "Updated password: $poolName" -ForegroundColor Green
         }
     }
 }
 finally {
     $plainTextPassword = $null
-}
 
-if ($RecycleUpdatedPools -and $updatedPools.Count -gt 0 -and -not $WhatIfPreference) {
-    Write-Host ""
+    if ($iisStopped -and -not $WhatIfPreference) {
+        Write-Host ''
+        Write-Host 'Starting IIS services...' -ForegroundColor Yellow
 
-    foreach ($poolName in $updatedPools) {
-        if ($PSCmdlet.ShouldProcess(
-            "IIS application pool '$poolName'",
-            'Recycle application pool'
-        )) {
-            Restart-WebAppPool -Name $poolName
+        try {
+            $was = Get-Service -Name WAS
+            if ($was.Status -ne 'Running') {
+                Start-Service -Name WAS
+                Wait-ServiceStatus -Name WAS -DesiredStatus Running
+            }
 
-            Write-Host "Recycled: $poolName" -ForegroundColor Green
+            $w3svc = Get-Service -Name W3SVC
+            if ($w3svc.Status -ne 'Running') {
+                Start-Service -Name W3SVC
+                Wait-ServiceStatus -Name W3SVC -DesiredStatus Running
+            }
+
+            Write-Host 'IIS services are running.' -ForegroundColor Green
+
+            foreach ($poolName in $runningPoolsBeforeStop) {
+                try {
+                    $currentState = (Get-WebAppPoolState -Name $poolName).Value
+                    if ($currentState -ne 'Started') {
+                        Start-WebAppPool -Name $poolName
+                    }
+                }
+                catch {
+                    Write-Warning "Could not restore application pool '$poolName' to Started: $($_.Exception.Message)"
+                }
+            }
+        }
+        catch {
+            Write-Error "IIS was stopped, but the script could not fully start IIS again: $($_.Exception.Message)"
+            throw
         }
     }
 }
 
-Write-Host ""
+if (-not $WhatIfPreference) {
+    Show-AppPoolStatus
+}
+
+Write-Host ''
 Write-Host 'Completed.' -ForegroundColor Green
