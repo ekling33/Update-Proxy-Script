@@ -1,19 +1,21 @@
 #requires -Version 5.1
 <#+
 .SYNOPSIS
-    Remotely updates Windows service and IIS application-pool credentials on a target server.
+    Remotely updates only the passwords for two Windows services and IIS application pools.
 
 .DESCRIPTION
-    Prompts for a target server, service account, and service-account password. Using the current
-    Windows identity (no credential prompt), it connects over PowerShell remoting and performs:
+    Prompts for a target server and one new password. It uses the service account already configured
+    on each target service and IIS application pool; it does not change any usernames or identities.
 
+    Using the current Windows identity (no admin credential prompt), the script performs:
       1. Stop IIS (W3SVC).
       2. Stop AuditService and SubmitFormManager.
-      3. Update the logon account and password for both services.
-      4. Update IIS application pools already configured with a SpecificUser identity.
-      5. Start both services.
+      3. Read the existing configured service account for each service and update only its password.
+      4. Read each IIS app pool. For pools using SpecificUser, retain the current username and update
+         only its password. Other pool identity types are skipped.
+      5. Start the two services.
       6. Start IIS (W3SVC).
-      7. Start updated IIS application pools and return service/pool start results.
+      7. Start updated IIS application pools and return final start/status results.
 
     Requirements:
       - Run this script from an elevated Windows PowerShell 5.1 session.
@@ -45,16 +47,10 @@ if ([string]::IsNullOrWhiteSpace($ComputerName)) {
     throw 'A target server name is required.'
 }
 
-$ServiceAccount = Read-Host -Prompt 'Enter the service account (for example, PROD\serviceaccount)'
-if ([string]::IsNullOrWhiteSpace($ServiceAccount)) {
-    throw 'A service account is required.'
-}
-
-$SecurePassword = Read-Host -Prompt "Enter the password for $ServiceAccount" -AsSecureString
+$SecurePassword = Read-Host -Prompt 'Enter the new password to apply to existing service and IIS application-pool accounts' -AsSecureString
 
 $RemoteScript = {
     param(
-        [string]$ServiceAccount,
         [System.Security.SecureString]$SecurePassword,
         [int]$StopTimeoutSeconds,
         [int]$StartTimeoutSeconds
@@ -63,6 +59,7 @@ $RemoteScript = {
     $ErrorActionPreference = 'Stop'
     $TargetServices = @('AuditService', 'SubmitFormManager')
     $IISServiceName = 'W3SVC'
+    $PlainTextPassword = $null
 
     function Convert-SecureStringToPlainText {
         param(
@@ -111,6 +108,7 @@ $RemoteScript = {
             [string]$Type,
             [string]$Action,
             [string]$FinalStatus,
+            [string]$Account,
             [string]$Detail
         )
 
@@ -120,15 +118,15 @@ $RemoteScript = {
             Type        = $Type
             Action      = $Action
             FinalStatus = $FinalStatus
+            Account     = $Account
             Detail      = $Detail
         }
     }
 
-    $PlainTextPassword = $null
-
     try {
         Import-Module WebAdministration -ErrorAction Stop
 
+        # Confirm prerequisites before changing or stopping anything.
         $missingServices = @($TargetServices | Where-Object {
             -not (Get-Service -Name $_ -ErrorAction SilentlyContinue)
         })
@@ -138,6 +136,47 @@ $RemoteScript = {
 
         if (-not (Get-Service -Name $IISServiceName -ErrorAction SilentlyContinue)) {
             throw "IIS service '$IISServiceName' was not found. Verify IIS is installed. No changes were made."
+        }
+
+        # Read the existing service accounts before stopping services or modifying configuration.
+        $serviceAccounts = @{}
+        foreach ($ServiceName in $TargetServices) {
+            $serviceConfig = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+            $startName = [string]$serviceConfig.StartName
+
+            if ([string]::IsNullOrWhiteSpace($startName)) {
+                throw "Could not determine the configured logon account for service '$ServiceName'. No changes were made."
+            }
+
+            # Password updates are applicable to user-managed service accounts, not built-in service identities.
+            if ($startName -match '^(LocalSystem|NT AUTHORITY\\(LocalService|NetworkService))$') {
+                throw "Service '$ServiceName' uses built-in account '$startName'. A password cannot be updated for this identity. No changes were made."
+            }
+
+            $serviceAccounts[$ServiceName] = $startName
+        }
+
+        # Snapshot the IIS pools that use SpecificUser. Their usernames will remain unchanged.
+        $specificUserPools = @()
+        $skippedAppPoolResults = @()
+        foreach ($appPool in Get-ChildItem -Path IIS:\AppPools) {
+            $poolName = $appPool.Name
+            $identityType = [string]$appPool.processModel.identityType
+
+            if ($identityType -eq 'SpecificUser') {
+                $userName = [string]$appPool.processModel.userName
+                if ([string]::IsNullOrWhiteSpace($userName)) {
+                    throw "Application pool '$poolName' is configured as SpecificUser but has no username. No changes were made."
+                }
+
+                $specificUserPools += [pscustomobject]@{
+                    Name     = $poolName
+                    UserName = $userName
+                }
+            }
+            else {
+                $skippedAppPoolResults += New-Result -Item $poolName -Type 'IIS Application Pool' -Action 'Skipped' -FinalStatus $appPool.State.ToString() -Account '' -Detail "Identity type is $identityType; no password exists to update."
+            }
         }
 
         $PlainTextPassword = Convert-SecureStringToPlainText -SecureString $SecurePassword
@@ -158,37 +197,26 @@ $RemoteScript = {
             }
         }
 
+        # sc.exe needs obj= and password= together. Passing the current StartName preserves the account;
+        # only the stored password is changed.
         foreach ($ServiceName in $TargetServices) {
-            Write-Host "[$env:COMPUTERNAME] Updating credentials for $ServiceName..." -ForegroundColor Cyan
-            $scOutput = & "$env:SystemRoot\System32\sc.exe" config $ServiceName obj= $ServiceAccount password= $PlainTextPassword 2>&1
+            $existingAccount = $serviceAccounts[$ServiceName]
+            Write-Host "[$env:COMPUTERNAME] Updating password for $ServiceName (account remains $existingAccount)..." -ForegroundColor Cyan
+            $scOutput = & "$env:SystemRoot\System32\sc.exe" config $ServiceName obj= $existingAccount password= $PlainTextPassword 2>&1
             if ($LASTEXITCODE -ne 0) {
-                throw "Failed to update service '$ServiceName'. sc.exe output: $($scOutput -join ' ')"
+                throw "Failed to update password for service '$ServiceName'. sc.exe output: $($scOutput -join ' ')"
             }
         }
 
-        $updatedAppPools = @()
-        $skippedAppPoolResults = @()
-
-        foreach ($appPool in Get-ChildItem -Path IIS:\AppPools) {
-            $poolName = $appPool.Name
-            $identityType = [string]$appPool.processModel.identityType
-
-            if ($identityType -eq 'SpecificUser') {
-                Write-Host "[$env:COMPUTERNAME] Updating application-pool credentials: $poolName" -ForegroundColor Cyan
-                Set-ItemProperty -Path "IIS:\AppPools\$poolName" -Name processModel -Value @{
-                    identityType = 'SpecificUser'
-                    userName     = $ServiceAccount
-                    password     = $PlainTextPassword
-                } -ErrorAction Stop
-                $updatedAppPools += $poolName
-            }
-            else {
-                $skippedAppPoolResults += New-Result -Item $poolName -Type 'IIS Application Pool' -Action 'Skipped' -FinalStatus $appPool.State.ToString() -Detail "Identity type is $identityType; only SpecificUser pools are changed."
-            }
+        # Update only the password property of each existing SpecificUser application pool.
+        foreach ($pool in $specificUserPools) {
+            Write-Host "[$env:COMPUTERNAME] Updating password for application pool $($pool.Name) (account remains $($pool.UserName))..." -ForegroundColor Cyan
+            Set-ItemProperty -Path "IIS:\AppPools\$($pool.Name)" -Name processModel.password -Value $PlainTextPassword -ErrorAction Stop
         }
 
         $serviceStartResults = @()
         foreach ($ServiceName in $TargetServices) {
+            $existingAccount = $serviceAccounts[$ServiceName]
             try {
                 Write-Host "[$env:COMPUTERNAME] Starting $ServiceName..." -ForegroundColor Cyan
                 $service = Get-Service -Name $ServiceName -ErrorAction Stop
@@ -197,12 +225,12 @@ $RemoteScript = {
                     Wait-ForServiceStatus -Name $ServiceName -DesiredStatus Running -TimeoutSeconds $StartTimeoutSeconds | Out-Null
                 }
                 $finalStatus = (Get-Service -Name $ServiceName).Status.ToString()
-                $serviceStartResults += New-Result -Item $ServiceName -Type 'Windows Service' -Action 'Started' -FinalStatus $finalStatus -Detail "Logon account configured as $ServiceAccount."
+                $serviceStartResults += New-Result -Item $ServiceName -Type 'Windows Service' -Action 'Started' -FinalStatus $finalStatus -Account $existingAccount -Detail 'Existing account retained; password updated.'
             }
             catch {
                 $finalStatus = 'Unknown'
                 try { $finalStatus = (Get-Service -Name $ServiceName -ErrorAction Stop).Status.ToString() } catch { }
-                $serviceStartResults += New-Result -Item $ServiceName -Type 'Windows Service' -Action 'Start failed' -FinalStatus $finalStatus -Detail $_.Exception.Message
+                $serviceStartResults += New-Result -Item $ServiceName -Type 'Windows Service' -Action 'Start failed' -FinalStatus $finalStatus -Account $existingAccount -Detail $_.Exception.Message
             }
         }
 
@@ -214,31 +242,31 @@ $RemoteScript = {
                 Start-Service -Name $IISServiceName -ErrorAction Stop
                 Wait-ForServiceStatus -Name $IISServiceName -DesiredStatus Running -TimeoutSeconds $StartTimeoutSeconds | Out-Null
             }
-            $iisStartResult = New-Result -Item $IISServiceName -Type 'Windows Service' -Action 'Started' -FinalStatus (Get-Service -Name $IISServiceName).Status.ToString() -Detail 'IIS web service started successfully.'
+            $iisStartResult = New-Result -Item $IISServiceName -Type 'Windows Service' -Action 'Started' -FinalStatus (Get-Service -Name $IISServiceName).Status.ToString() -Account '' -Detail 'IIS web service started successfully.'
         }
         catch {
             $finalStatus = 'Unknown'
             try { $finalStatus = (Get-Service -Name $IISServiceName -ErrorAction Stop).Status.ToString() } catch { }
-            $iisStartResult = New-Result -Item $IISServiceName -Type 'Windows Service' -Action 'Start failed' -FinalStatus $finalStatus -Detail $_.Exception.Message
+            $iisStartResult = New-Result -Item $IISServiceName -Type 'Windows Service' -Action 'Start failed' -FinalStatus $finalStatus -Account '' -Detail $_.Exception.Message
         }
 
         $appPoolStartResults = @()
-        foreach ($poolName in $updatedAppPools) {
+        foreach ($pool in $specificUserPools) {
             try {
-                Write-Host "[$env:COMPUTERNAME] Starting application pool $poolName..." -ForegroundColor Cyan
-                $pool = Get-Item -Path "IIS:\AppPools\$poolName" -ErrorAction Stop
-                if ($pool.State -ne 'Started') {
-                    Start-WebAppPool -Name $poolName -ErrorAction Stop
+                Write-Host "[$env:COMPUTERNAME] Starting application pool $($pool.Name)..." -ForegroundColor Cyan
+                $appPool = Get-Item -Path "IIS:\AppPools\$($pool.Name)" -ErrorAction Stop
+                if ($appPool.State -ne 'Started') {
+                    Start-WebAppPool -Name $pool.Name -ErrorAction Stop
                 }
 
                 Start-Sleep -Seconds 2
-                $finalPool = Get-Item -Path "IIS:\AppPools\$poolName" -ErrorAction Stop
-                $appPoolStartResults += New-Result -Item $poolName -Type 'IIS Application Pool' -Action 'Started' -FinalStatus $finalPool.State.ToString() -Detail "Identity configured as $ServiceAccount."
+                $finalPool = Get-Item -Path "IIS:\AppPools\$($pool.Name)" -ErrorAction Stop
+                $appPoolStartResults += New-Result -Item $pool.Name -Type 'IIS Application Pool' -Action 'Started' -FinalStatus $finalPool.State.ToString() -Account $pool.UserName -Detail 'Existing identity retained; password updated.'
             }
             catch {
                 $finalStatus = 'Unknown'
-                try { $finalStatus = (Get-Item -Path "IIS:\AppPools\$poolName" -ErrorAction Stop).State.ToString() } catch { }
-                $appPoolStartResults += New-Result -Item $poolName -Type 'IIS Application Pool' -Action 'Start failed' -FinalStatus $finalStatus -Detail $_.Exception.Message
+                try { $finalStatus = (Get-Item -Path "IIS:\AppPools\$($pool.Name)" -ErrorAction Stop).State.ToString() } catch { }
+                $appPoolStartResults += New-Result -Item $pool.Name -Type 'IIS Application Pool' -Action 'Start failed' -FinalStatus $finalStatus -Account $pool.UserName -Detail $_.Exception.Message
             }
         }
 
@@ -257,8 +285,8 @@ try {
     Write-Host "Testing PowerShell remoting connection to $ComputerName..." -ForegroundColor Cyan
     Test-WSMan -ComputerName $ComputerName -ErrorAction Stop | Out-Null
 
-    Write-Host "Connected. Running update on $ComputerName using your current Windows credentials..." -ForegroundColor Green
-    $results = Invoke-Command -ComputerName $ComputerName -ScriptBlock $RemoteScript -ArgumentList $ServiceAccount, $SecurePassword, $StopTimeoutSeconds, $StartTimeoutSeconds -ErrorAction Stop
+    Write-Host "Connected. Updating passwords on $ComputerName using your current Windows credentials..." -ForegroundColor Green
+    $results = Invoke-Command -ComputerName $ComputerName -ScriptBlock $RemoteScript -ArgumentList $SecurePassword, $StopTimeoutSeconds, $StartTimeoutSeconds -ErrorAction Stop
 
     $serviceResults = @($results | Where-Object { $_.Type -eq 'Windows Service' -and $_.Item -in @('AuditService', 'SubmitFormManager') })
     $iisResult = @($results | Where-Object { $_.Type -eq 'Windows Service' -and $_.Item -eq 'W3SVC' })
@@ -266,24 +294,24 @@ try {
     $skippedPoolResults = @($results | Where-Object { $_.Type -eq 'IIS Application Pool' -and $_.Action -eq 'Skipped' })
 
     Write-Host "`nService start results:" -ForegroundColor Yellow
-    $serviceResults | Format-Table Server, Item, Action, FinalStatus, Detail -AutoSize
+    $serviceResults | Format-Table Server, Item, Action, FinalStatus, Account, Detail -AutoSize
 
     Write-Host "`nIIS service start result:" -ForegroundColor Yellow
     $iisResult | Format-Table Server, Item, Action, FinalStatus, Detail -AutoSize
 
-    Write-Host "`nIIS application-pool start results (SpecificUser pools updated):" -ForegroundColor Yellow
+    Write-Host "`nIIS application-pool start results (SpecificUser pools with passwords updated):" -ForegroundColor Yellow
     if ($appPoolResults.Count -gt 0) {
-        $appPoolResults | Format-Table Server, Item, Action, FinalStatus, Detail -AutoSize
+        $appPoolResults | Format-Table Server, Item, Action, FinalStatus, Account, Detail -AutoSize
     }
     else {
         Write-Host 'No application pools using SpecificUser were found to update and start.' -ForegroundColor DarkYellow
     }
 
     if ($skippedPoolResults.Count -gt 0) {
-        Write-Host "`nApplication pools skipped (non-SpecificUser identities):" -ForegroundColor Yellow
+        Write-Host "`nApplication pools skipped (identities without a managed password):" -ForegroundColor Yellow
         $skippedPoolResults | Format-Table Server, Item, FinalStatus, Detail -AutoSize
     }
 }
 catch {
-    throw "Remote update failed for '$ComputerName': $($_.Exception.Message)"
+    throw "Remote password update failed for '$ComputerName': $($_.Exception.Message)"
 }
