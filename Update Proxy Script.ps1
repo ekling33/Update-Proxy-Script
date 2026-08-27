@@ -1,317 +1,143 @@
 #requires -Version 5.1
 <#+
 .SYNOPSIS
-    Remotely updates only the passwords for two Windows services and IIS application pools.
+    Remotely updates the RabbitMQ Windows service logon password and verifies startup.
 
 .DESCRIPTION
-    Prompts for a target server and one new password. It uses the service account already configured
-    on each target service and IIS application pool; it does not change any usernames or identities.
+    Prompts for a target server and the password for the RabbitMQ service account.
+    The script discovers the RabbitMQ Windows service on the remote server, stops it,
+    updates its existing Log On As account with the new password, starts it, waits one
+    minute, and reports the service status.
 
-    Using the current Windows identity (no admin credential prompt), the script performs:
-      1. Stop IIS (W3SVC).
-      2. Stop AuditService and SubmitFormManager.
-      3. Read the existing configured service account for each service and update only its password.
-      4. Read each IIS app pool. For pools using SpecificUser, retain the current username and update
-         only its password. Other pool identity types are skipped.
-      5. Start the two services.
-      6. Start IIS (W3SVC).
-      7. Start updated IIS application pools and return final start/status results.
-
-    Requirements:
-      - Run this script from an elevated Windows PowerShell 5.1 session.
-      - PowerShell remoting/WinRM must be enabled and reachable on the target server.
-      - Your current Windows identity must be an administrator on the target server.
-      - IIS and the WebAdministration module must be installed on the target server.
+.NOTES
+    Run from an elevated Windows PowerShell 5.1 session with administrative rights on
+    the target server. PowerShell remoting (WinRM) must be enabled and reachable.
 #>
 
-[CmdletBinding()]
-param(
-    [int]$StopTimeoutSeconds = 120,
-    [int]$StartTimeoutSeconds = 120
-)
-
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Test-IsAdministrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function Read-TargetServer {
+    do {
+        $server = Read-Host 'Enter the target server hostname'
+        if ([string]::IsNullOrWhiteSpace($server)) {
+            Write-Warning 'A target server hostname is required.'
+        }
+    } until (-not [string]::IsNullOrWhiteSpace($server))
+
+    return $server.Trim()
 }
 
-if (-not (Test-IsAdministrator)) {
-    throw 'Run this script from an elevated Windows PowerShell 5.1 session as an administrator.'
-}
-
-$ComputerName = Read-Host -Prompt 'Enter the target server name (for example, APP-SERVER-01 or APP-SERVER-01.contoso.com)'
-if ([string]::IsNullOrWhiteSpace($ComputerName)) {
-    throw 'A target server name is required.'
-}
-
-$SecurePassword = Read-Host -Prompt 'Enter the new password to apply to existing service and IIS application-pool accounts' -AsSecureString
-
-$RemoteScript = {
+function Get-RabbitMQService {
     param(
-        [System.Security.SecureString]$SecurePassword,
-        [int]$StopTimeoutSeconds,
-        [int]$StartTimeoutSeconds
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName
     )
 
-    $ErrorActionPreference = 'Stop'
-    $TargetServices = @('AuditService', 'SubmitFormManager')
-    $IISServiceName = 'W3SVC'
-    $PlainTextPassword = $null
-
-    function Convert-SecureStringToPlainText {
-        param(
-            [Parameter(Mandatory)]
-            [System.Security.SecureString]$SecureString
-        )
-
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-        try {
-            [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    $services = Get-CimInstance -ClassName Win32_Service -ComputerName $ComputerName |
+        Where-Object {
+            $_.Name -match 'rabbitmq' -or
+            $_.DisplayName -match 'rabbitmq'
         }
-        finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
+
+    if (-not $services) {
+        throw "No RabbitMQ Windows service was found on '$ComputerName'."
     }
 
-    function Wait-ForServiceStatus {
-        param(
-            [Parameter(Mandatory)]
-            [string]$Name,
-
-            [Parameter(Mandatory)]
-            [ValidateSet('Running', 'Stopped')]
-            [string]$DesiredStatus,
-
-            [Parameter(Mandatory)]
-            [int]$TimeoutSeconds
-        )
-
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        do {
-            $service = Get-Service -Name $Name -ErrorAction Stop
-            if ($service.Status.ToString() -eq $DesiredStatus) {
-                return $service
-            }
-            Start-Sleep -Seconds 2
-        } while ((Get-Date) -lt $deadline)
-
-        $finalService = Get-Service -Name $Name -ErrorAction Stop
-        throw "Timed out waiting for service '$Name' to reach '$DesiredStatus'. Current status: $($finalService.Status)."
+    if (@($services).Count -gt 1) {
+        $details = ($services | ForEach-Object { "Name='$($_.Name)', DisplayName='$($_.DisplayName)'" }) -join '; '
+        throw "More than one RabbitMQ-related service was found on '$ComputerName': $details"
     }
 
-    function New-Result {
-        param(
-            [string]$Item,
-            [string]$Type,
-            [string]$Action,
-            [string]$FinalStatus,
-            [string]$Account,
-            [string]$Detail
-        )
-
-        [pscustomobject]@{
-            Server      = $env:COMPUTERNAME
-            Item        = $Item
-            Type        = $Type
-            Action      = $Action
-            FinalStatus = $FinalStatus
-            Account     = $Account
-            Detail      = $Detail
-        }
-    }
-
-    try {
-        Import-Module WebAdministration -ErrorAction Stop
-
-        # Confirm prerequisites before changing or stopping anything.
-        $missingServices = @($TargetServices | Where-Object {
-            -not (Get-Service -Name $_ -ErrorAction SilentlyContinue)
-        })
-        if ($missingServices.Count -gt 0) {
-            throw "Required service(s) not found: $($missingServices -join ', '). No changes were made."
-        }
-
-        if (-not (Get-Service -Name $IISServiceName -ErrorAction SilentlyContinue)) {
-            throw "IIS service '$IISServiceName' was not found. Verify IIS is installed. No changes were made."
-        }
-
-        # Read the existing service accounts before stopping services or modifying configuration.
-        $serviceAccounts = @{}
-        foreach ($ServiceName in $TargetServices) {
-            $serviceConfig = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
-            $startName = [string]$serviceConfig.StartName
-
-            if ([string]::IsNullOrWhiteSpace($startName)) {
-                throw "Could not determine the configured logon account for service '$ServiceName'. No changes were made."
-            }
-
-            # Password updates are applicable to user-managed service accounts, not built-in service identities.
-            if ($startName -match '^(LocalSystem|NT AUTHORITY\\(LocalService|NetworkService))$') {
-                throw "Service '$ServiceName' uses built-in account '$startName'. A password cannot be updated for this identity. No changes were made."
-            }
-
-            $serviceAccounts[$ServiceName] = $startName
-        }
-
-        # Snapshot the IIS pools that use SpecificUser. Their usernames will remain unchanged.
-        $specificUserPools = @()
-        $skippedAppPoolResults = @()
-        foreach ($appPool in Get-ChildItem -Path IIS:\AppPools) {
-            $poolName = $appPool.Name
-            $identityType = [string]$appPool.processModel.identityType
-
-            if ($identityType -eq 'SpecificUser') {
-                $userName = [string]$appPool.processModel.userName
-                if ([string]::IsNullOrWhiteSpace($userName)) {
-                    throw "Application pool '$poolName' is configured as SpecificUser but has no username. No changes were made."
-                }
-
-                $specificUserPools += [pscustomobject]@{
-                    Name     = $poolName
-                    UserName = $userName
-                }
-            }
-            else {
-                $skippedAppPoolResults += New-Result -Item $poolName -Type 'IIS Application Pool' -Action 'Skipped' -FinalStatus $appPool.State.ToString() -Account '' -Detail "Identity type is $identityType; no password exists to update."
-            }
-        }
-
-        $PlainTextPassword = Convert-SecureStringToPlainText -SecureString $SecurePassword
-
-        Write-Host "[$env:COMPUTERNAME] Stopping IIS service ($IISServiceName)..." -ForegroundColor Cyan
-        $iisService = Get-Service -Name $IISServiceName -ErrorAction Stop
-        if ($iisService.Status -ne 'Stopped') {
-            Stop-Service -Name $IISServiceName -Force -ErrorAction Stop
-            Wait-ForServiceStatus -Name $IISServiceName -DesiredStatus Stopped -TimeoutSeconds $StopTimeoutSeconds | Out-Null
-        }
-
-        foreach ($ServiceName in $TargetServices) {
-            Write-Host "[$env:COMPUTERNAME] Stopping $ServiceName..." -ForegroundColor Cyan
-            $service = Get-Service -Name $ServiceName -ErrorAction Stop
-            if ($service.Status -ne 'Stopped') {
-                Stop-Service -Name $ServiceName -Force -ErrorAction Stop
-                Wait-ForServiceStatus -Name $ServiceName -DesiredStatus Stopped -TimeoutSeconds $StopTimeoutSeconds | Out-Null
-            }
-        }
-
-        # sc.exe needs obj= and password= together. Passing the current StartName preserves the account;
-        # only the stored password is changed.
-        foreach ($ServiceName in $TargetServices) {
-            $existingAccount = $serviceAccounts[$ServiceName]
-            Write-Host "[$env:COMPUTERNAME] Updating password for $ServiceName (account remains $existingAccount)..." -ForegroundColor Cyan
-            $scOutput = & "$env:SystemRoot\System32\sc.exe" config $ServiceName obj= $existingAccount password= $PlainTextPassword 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw "Failed to update password for service '$ServiceName'. sc.exe output: $($scOutput -join ' ')"
-            }
-        }
-
-        # Update only the password property of each existing SpecificUser application pool.
-        foreach ($pool in $specificUserPools) {
-            Write-Host "[$env:COMPUTERNAME] Updating password for application pool $($pool.Name) (account remains $($pool.UserName))..." -ForegroundColor Cyan
-            Set-ItemProperty -Path "IIS:\AppPools\$($pool.Name)" -Name processModel.password -Value $PlainTextPassword -ErrorAction Stop
-        }
-
-        $serviceStartResults = @()
-        foreach ($ServiceName in $TargetServices) {
-            $existingAccount = $serviceAccounts[$ServiceName]
-            try {
-                Write-Host "[$env:COMPUTERNAME] Starting $ServiceName..." -ForegroundColor Cyan
-                $service = Get-Service -Name $ServiceName -ErrorAction Stop
-                if ($service.Status -ne 'Running') {
-                    Start-Service -Name $ServiceName -ErrorAction Stop
-                    Wait-ForServiceStatus -Name $ServiceName -DesiredStatus Running -TimeoutSeconds $StartTimeoutSeconds | Out-Null
-                }
-                $finalStatus = (Get-Service -Name $ServiceName).Status.ToString()
-                $serviceStartResults += New-Result -Item $ServiceName -Type 'Windows Service' -Action 'Started' -FinalStatus $finalStatus -Account $existingAccount -Detail 'Existing account retained; password updated.'
-            }
-            catch {
-                $finalStatus = 'Unknown'
-                try { $finalStatus = (Get-Service -Name $ServiceName -ErrorAction Stop).Status.ToString() } catch { }
-                $serviceStartResults += New-Result -Item $ServiceName -Type 'Windows Service' -Action 'Start failed' -FinalStatus $finalStatus -Account $existingAccount -Detail $_.Exception.Message
-            }
-        }
-
-        $iisStartResult = $null
-        try {
-            Write-Host "[$env:COMPUTERNAME] Starting IIS service ($IISServiceName)..." -ForegroundColor Cyan
-            $iisService = Get-Service -Name $IISServiceName -ErrorAction Stop
-            if ($iisService.Status -ne 'Running') {
-                Start-Service -Name $IISServiceName -ErrorAction Stop
-                Wait-ForServiceStatus -Name $IISServiceName -DesiredStatus Running -TimeoutSeconds $StartTimeoutSeconds | Out-Null
-            }
-            $iisStartResult = New-Result -Item $IISServiceName -Type 'Windows Service' -Action 'Started' -FinalStatus (Get-Service -Name $IISServiceName).Status.ToString() -Account '' -Detail 'IIS web service started successfully.'
-        }
-        catch {
-            $finalStatus = 'Unknown'
-            try { $finalStatus = (Get-Service -Name $IISServiceName -ErrorAction Stop).Status.ToString() } catch { }
-            $iisStartResult = New-Result -Item $IISServiceName -Type 'Windows Service' -Action 'Start failed' -FinalStatus $finalStatus -Account '' -Detail $_.Exception.Message
-        }
-
-        $appPoolStartResults = @()
-        foreach ($pool in $specificUserPools) {
-            try {
-                Write-Host "[$env:COMPUTERNAME] Starting application pool $($pool.Name)..." -ForegroundColor Cyan
-                $appPool = Get-Item -Path "IIS:\AppPools\$($pool.Name)" -ErrorAction Stop
-                if ($appPool.State -ne 'Started') {
-                    Start-WebAppPool -Name $pool.Name -ErrorAction Stop
-                }
-
-                Start-Sleep -Seconds 2
-                $finalPool = Get-Item -Path "IIS:\AppPools\$($pool.Name)" -ErrorAction Stop
-                $appPoolStartResults += New-Result -Item $pool.Name -Type 'IIS Application Pool' -Action 'Started' -FinalStatus $finalPool.State.ToString() -Account $pool.UserName -Detail 'Existing identity retained; password updated.'
-            }
-            catch {
-                $finalStatus = 'Unknown'
-                try { $finalStatus = (Get-Item -Path "IIS:\AppPools\$($pool.Name)" -ErrorAction Stop).State.ToString() } catch { }
-                $appPoolStartResults += New-Result -Item $pool.Name -Type 'IIS Application Pool' -Action 'Start failed' -FinalStatus $finalStatus -Account $pool.UserName -Detail $_.Exception.Message
-            }
-        }
-
-        # Return structured objects to the calling session for final reporting.
-        $serviceStartResults
-        $iisStartResult
-        $appPoolStartResults
-        $skippedAppPoolResults
-    }
-    finally {
-        $PlainTextPassword = $null
-    }
+    return @($services)[0]
 }
 
+$targetServer = Read-TargetServer
+
 try {
-    Write-Host "Testing PowerShell remoting connection to $ComputerName..." -ForegroundColor Cyan
-    Test-WSMan -ComputerName $ComputerName -ErrorAction Stop | Out-Null
+    Write-Host "Validating access to $targetServer..." -ForegroundColor Cyan
+    Test-WSMan -ComputerName $targetServer -ErrorAction Stop | Out-Null
 
-    Write-Host "Connected. Updating passwords on $ComputerName using your current Windows credentials..." -ForegroundColor Green
-    $results = Invoke-Command -ComputerName $ComputerName -ScriptBlock $RemoteScript -ArgumentList $SecurePassword, $StopTimeoutSeconds, $StartTimeoutSeconds -ErrorAction Stop
+    $rabbitService = Get-RabbitMQService -ComputerName $targetServer
+    $serviceName = $rabbitService.Name
+    $serviceAccount = $rabbitService.StartName
 
-    $serviceResults = @($results | Where-Object { $_.Type -eq 'Windows Service' -and $_.Item -in @('AuditService', 'SubmitFormManager') })
-    $iisResult = @($results | Where-Object { $_.Type -eq 'Windows Service' -and $_.Item -eq 'W3SVC' })
-    $appPoolResults = @($results | Where-Object { $_.Type -eq 'IIS Application Pool' -and $_.Action -ne 'Skipped' })
-    $skippedPoolResults = @($results | Where-Object { $_.Type -eq 'IIS Application Pool' -and $_.Action -eq 'Skipped' })
+    if ([string]::IsNullOrWhiteSpace($serviceAccount) -or
+        $serviceAccount -match '^(LocalSystem|LocalService|NetworkService)$') {
+        throw "RabbitMQ service '$serviceName' on '$targetServer' is configured to run as '$serviceAccount'. A password cannot be updated for a built-in service account."
+    }
 
-    Write-Host "`nService start results:" -ForegroundColor Yellow
-    $serviceResults | Format-Table Server, Item, Action, FinalStatus, Account, Detail -AutoSize
+    Write-Host "RabbitMQ service found: $($rabbitService.DisplayName) ($serviceName)" -ForegroundColor Green
+    Write-Host "Configured service account: $serviceAccount" -ForegroundColor Green
 
-    Write-Host "`nIIS service start result:" -ForegroundColor Yellow
-    $iisResult | Format-Table Server, Item, Action, FinalStatus, Detail -AutoSize
+    $remoteScript = {
+        param(
+            [string]$ServiceName,
+            [string]$ServiceAccount,
+            [securestring]$NewPassword
+        )
 
-    Write-Host "`nIIS application-pool start results (SpecificUser pools with passwords updated):" -ForegroundColor Yellow
-    if ($appPoolResults.Count -gt 0) {
-        $appPoolResults | Format-Table Server, Item, Action, FinalStatus, Account, Detail -AutoSize
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'"
+        if (-not $service) {
+            throw "Service '$ServiceName' was not found."
+        }
+
+        if ($service.State -ne 'Stopped') {
+            Write-Host "Stopping service '$ServiceName'..." -ForegroundColor Cyan
+            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+            (Get-Service -Name $ServiceName).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromMinutes(2))
+        }
+
+        Write-Host "Updating the logon password for '$ServiceAccount'..." -ForegroundColor Cyan
+        $changeResult = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{
+            StartName     = $ServiceAccount
+            StartPassword = $NewPassword
+        }
+
+        if ($changeResult.ReturnValue -ne 0) {
+            throw "Win32_Service.Change failed with return value $($changeResult.ReturnValue)."
+        }
+
+        Write-Host "Starting service '$ServiceName'..." -ForegroundColor Cyan
+        Start-Service -Name $ServiceName -ErrorAction Stop
+
+        Write-Host 'Waiting 60 seconds before checking status...' -ForegroundColor Cyan
+        Start-Sleep -Seconds 60
+
+        $finalService = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'"
+        [pscustomobject]@{
+            ComputerName = $env:COMPUTERNAME
+            ServiceName  = $finalService.Name
+            DisplayName  = $finalService.DisplayName
+            Status       = $finalService.State
+            StartMode    = $finalService.StartMode
+            StartName    = $finalService.StartName
+            ExitCode     = $finalService.ExitCode
+            ProcessId    = $finalService.ProcessId
+        }
+    }
+
+    $newPassword = Read-Host "Enter the new password for '$serviceAccount'" -AsSecureString
+    if ($null -eq $newPassword) {
+        throw 'No password was supplied.'
+    }
+
+    $result = Invoke-Command -ComputerName $targetServer -ScriptBlock $remoteScript -ArgumentList $serviceName, $serviceAccount, $newPassword -ErrorAction Stop
+
+    Write-Host "`nRabbitMQ service status after one minute:" -ForegroundColor Cyan
+    $result | Format-List ComputerName, ServiceName, DisplayName, Status, StartMode, StartName, ExitCode, ProcessId
+
+    if ($result.Status -eq 'Running') {
+        Write-Host "RabbitMQ is running on $targetServer." -ForegroundColor Green
     }
     else {
-        Write-Host 'No application pools using SpecificUser were found to update and start.' -ForegroundColor DarkYellow
-    }
-
-    if ($skippedPoolResults.Count -gt 0) {
-        Write-Host "`nApplication pools skipped (identities without a managed password):" -ForegroundColor Yellow
-        $skippedPoolResults | Format-Table Server, Item, FinalStatus, Detail -AutoSize
+        Write-Warning "RabbitMQ is not running on $targetServer. Reported status: $($result.Status); ExitCode: $($result.ExitCode)."
     }
 }
 catch {
-    throw "Remote password update failed for '$ComputerName': $($_.Exception.Message)"
+    Write-Error "RabbitMQ service account update failed on '$targetServer': $($_.Exception.Message)"
+    exit 1
 }
