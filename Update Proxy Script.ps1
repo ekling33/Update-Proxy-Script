@@ -7,26 +7,14 @@
 .DESCRIPTION
     Run locally on an IIS server from an elevated Windows PowerShell 5.1 session.
 
-    The script prompts for an identity username and new password. It stops IIS by stopping
-    the World Wide Web Publishing Service (W3SVC) and Windows Process Activation Service (WAS),
-    pauses with an "IIS STOPPED. Press Enter to continue..." prompt, backs up
-    applicationHost.config, updates matching SpecificUser application pools, starts WAS and
-    W3SVC again, then reports the status of every IIS application pool.
+    IMPORTANT: -WhatIf is a simulation mode. It intentionally does NOT stop IIS, does NOT pause
+    at the IIS-stopped prompt, does NOT create a backup, does NOT change passwords, and does NOT
+    start IIS. Run without -WhatIf during the maintenance window to perform the actual sequence.
 
     The following pools are never modified:
       - .NET v4.5
       - .NET v4.5 Classic
       - DefaultAppPool
-
-    Before stopping IIS, the script records which pools were running. After IIS starts, it
-    starts only the pools that were running before the outage. Pools that were already stopped
-    remain stopped.
-
-.EXAMPLE
-    .\Interact_AppPool_Password_Update.ps1 -WhatIf
-
-.EXAMPLE
-    .\Interact_AppPool_Password_Update.ps1
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
@@ -174,6 +162,12 @@ $runningPoolsBeforeStop = @(
 
 Write-Host ''
 Write-Host "Application pools running before IIS is stopped: $($runningPoolsBeforeStop.Count)" -ForegroundColor Cyan
+
+if ($WhatIfPreference) {
+    Write-Host ''
+    Write-Host 'WHATIF MODE: IIS will not be stopped, no pause will occur, no passwords will be changed, and IIS will not be started.' -ForegroundColor Yellow
+    Write-Host 'Run the script without -WhatIf during the maintenance window to stop IIS and reach the Enter prompt.' -ForegroundColor Yellow
+}
 
 $plainTextPassword = ConvertTo-PlainText -SecureString $NewPassword
 $iisStopped = $false
