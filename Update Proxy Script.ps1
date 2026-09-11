@@ -1,150 +1,155 @@
-<#
-.SYNOPSIS
-    Remotely configures Microsoft Edge Stable rollback policy on computers listed in machines.txt.
+# Windows PowerShell 5.1 script.
+# Run from an elevated PowerShell window.
+# Put machines.txt in the same folder as this script.
+# One computer name or FQDN per line. Lines beginning with # are ignored.
 
-.DESCRIPTION
-    Windows PowerShell 5.1 compatible. Run from an elevated PowerShell session using your
-    current administrative credentials. Do not use Get-Credential.
-
-    Put machines.txt in the same folder as this script. Use one hostname or FQDN per line.
-    Blank lines and lines beginning with # are ignored.
-#>
-
-[CmdletBinding()]
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$TargetVersion = '152.0.4191.66',
-
-    [string]$MachineList = (Join-Path -Path $PSScriptRoot -ChildPath 'machines.txt'),
-
     [switch]$RestartEdgeUpdateService
 )
 
 $ErrorActionPreference = 'Stop'
 
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Start Windows PowerShell 5.1 with Run as Administrator, then run this script.'
+if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $ScriptFolder = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+else {
+    $ScriptFolder = $PSScriptRoot
+}
+
+$MachineList = Join-Path -Path $ScriptFolder -ChildPath 'machines.txt'
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList $identity
+$isAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdministrator) {
+    throw 'Run this script from Windows PowerShell as Administrator.'
 }
 
 if (-not (Test-Path -LiteralPath $MachineList)) {
-    throw "Machine list was not found: $MachineList"
+    throw ('machines.txt was not found: ' + $MachineList)
 }
 
-$computers = Get-Content -LiteralPath $MachineList |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith('#') } |
-    Sort-Object -Unique
+$computers = @()
+foreach ($line in (Get-Content -LiteralPath $MachineList)) {
+    $name = $line.Trim()
+    if (($name.Length -gt 0) -and (-not $name.StartsWith('#'))) {
+        $computers += $name
+    }
+}
+$computers = $computers | Sort-Object -Unique
 
-if (-not $computers) {
-    throw "No computer names were found in: $MachineList"
+if ($computers.Count -eq 0) {
+    throw ('No computer names were found in: ' + $MachineList)
 }
 
 $remoteScript = {
     param(
         [string]$RequestedTargetVersion,
-        [bool]$RestartUpdateServices
+        [bool]$RestartServices
     )
 
     $ErrorActionPreference = 'Stop'
 
     $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate'
-    $stableAppGuid = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
-    $rollbackValueName = 'RollbackToTargetVersion' + $stableAppGuid
-    $targetValueName = 'TargetVersionPrefix' + $stableAppGuid
-    $updateValueName = 'Update' + $stableAppGuid
+    $stableGuid = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
+    $rollbackName = 'RollbackToTargetVersion' + $stableGuid
+    $targetName = 'TargetVersionPrefix' + $stableGuid
+    $updateName = 'Update' + $stableGuid
 
-    $edgeExePaths = @()
-    if (${env:ProgramFiles(x86)}) {
-        $edgeExePaths += (Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Microsoft\Edge\Application\msedge.exe')
-    }
-    if ($env:ProgramFiles) {
-        $edgeExePaths += (Join-Path -Path $env:ProgramFiles -ChildPath 'Microsoft\Edge\Application\msedge.exe')
-    }
-    $edgeExePaths = $edgeExePaths | Where-Object { Test-Path -LiteralPath $_ }
+    $edgeExe = $null
+    $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    $programFiles = [Environment]::GetEnvironmentVariable('ProgramFiles')
 
-    $beforeVersion = $null
-    if ($edgeExePaths.Count -gt 0) {
-        $beforeVersion = (Get-Item -LiteralPath $edgeExePaths[0]).VersionInfo.ProductVersion
+    if (-not [string]::IsNullOrEmpty($programFilesX86)) {
+        $candidate = Join-Path -Path $programFilesX86 -ChildPath 'Microsoft\Edge\Application\msedge.exe'
+        if (Test-Path -LiteralPath $candidate) {
+            $edgeExe = $candidate
+        }
+    }
+
+    if (($null -eq $edgeExe) -and (-not [string]::IsNullOrEmpty($programFiles))) {
+        $candidate = Join-Path -Path $programFiles -ChildPath 'Microsoft\Edge\Application\msedge.exe'
+        if (Test-Path -LiteralPath $candidate) {
+            $edgeExe = $candidate
+        }
+    }
+
+    $installedVersion = $null
+    if ($null -ne $edgeExe) {
+        $installedVersion = (Get-Item -LiteralPath $edgeExe).VersionInfo.ProductVersion
     }
 
     New-Item -Path $policyPath -Force | Out-Null
-    New-ItemProperty -Path $policyPath -Name $rollbackValueName -PropertyType DWord -Value 1 -Force | Out-Null
-    New-ItemProperty -Path $policyPath -Name $targetValueName -PropertyType String -Value $RequestedTargetVersion -Force | Out-Null
-    New-ItemProperty -Path $policyPath -Name $updateValueName -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -Path $policyPath -Name $rollbackName -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -Path $policyPath -Name $targetName -PropertyType String -Value $RequestedTargetVersion -Force | Out-Null
+    New-ItemProperty -Path $policyPath -Name $updateName -PropertyType DWord -Value 1 -Force | Out-Null
 
-    $serviceResults = @()
-    if ($RestartUpdateServices) {
+    $serviceStatus = ''
+    if ($RestartServices) {
+        $messages = @()
         foreach ($serviceName in @('edgeupdate', 'edgeupdatem')) {
             $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
             if ($null -eq $service) {
-                $serviceResults += ($serviceName + ' not found')
-                continue
+                $messages += ($serviceName + ' not found')
             }
-
-            try {
-                if ($service.Status -eq 'Running') {
-                    Restart-Service -Name $serviceName -Force -ErrorAction Stop
-                    $serviceResults += ($serviceName + ' restarted')
+            else {
+                try {
+                    if ($service.Status -eq 'Running') {
+                        Restart-Service -Name $serviceName -Force -ErrorAction Stop
+                        $messages += ($serviceName + ' restarted')
+                    }
+                    else {
+                        Start-Service -Name $serviceName -ErrorAction Stop
+                        $messages += ($serviceName + ' started')
+                    }
                 }
-                else {
-                    Start-Service -Name $serviceName -ErrorAction Stop
-                    $serviceResults += ($serviceName + ' started')
+                catch {
+                    $messages += ($serviceName + ' service error: ' + $_.Exception.Message)
                 }
-            }
-            catch {
-                $serviceResults += ($serviceName + ': ' + $_.Exception.Message)
             }
         }
+        $serviceStatus = $messages -join '; '
     }
 
-    $policyValues = Get-ItemProperty -Path $policyPath -ErrorAction Stop
+    $values = Get-ItemProperty -Path $policyPath
 
-    [PSCustomObject]@{
-        ComputerName       = $env:COMPUTERNAME
-        InstalledVersion   = $beforeVersion
-        TargetVersion      = $policyValues.$targetValueName
-        RollbackEnabled    = $policyValues.$rollbackValueName
-        UpdatePolicy       = $policyValues.$updateValueName
-        EdgeUpdateServices = ($serviceResults -join '; ')
-        Status             = 'Policy configured. Edge Update must complete a successful update check before the version changes.'
-    }
+    $output = New-Object PSObject
+    $output | Add-Member -MemberType NoteProperty -Name ComputerName -Value $env:COMPUTERNAME
+    $output | Add-Member -MemberType NoteProperty -Name InstalledVersion -Value $installedVersion
+    $output | Add-Member -MemberType NoteProperty -Name TargetVersion -Value $values.$targetName
+    $output | Add-Member -MemberType NoteProperty -Name RollbackEnabled -Value $values.$rollbackName
+    $output | Add-Member -MemberType NoteProperty -Name UpdatePolicy -Value $values.$updateName
+    $output | Add-Member -MemberType NoteProperty -Name EdgeUpdateServices -Value $serviceStatus
+    $output | Add-Member -MemberType NoteProperty -Name Status -Value 'Policy configured. Edge Update must complete a successful update check before the version changes.'
+    $output
 }
 
-$results = foreach ($computer in $computers) {
+$results = @()
+foreach ($computer in $computers) {
     Write-Host ('Processing ' + $computer + ' ...') -ForegroundColor Cyan
 
     try {
-        Invoke-Command -ComputerName $computer -ScriptBlock $remoteScript -ArgumentList $TargetVersion, [bool]$RestartEdgeUpdateService -ErrorAction Stop
+        $result = Invoke-Command -ComputerName $computer -ScriptBlock $remoteScript -ArgumentList $TargetVersion, ([bool]$RestartEdgeUpdateService) -ErrorAction Stop
+        $results += $result
     }
     catch {
-        [PSCustomObject]@{
-            ComputerName       = $computer
-            InstalledVersion   = $null
-            TargetVersion      = $TargetVersion
-            RollbackEnabled    = $null
-            UpdatePolicy       = $null
-            EdgeUpdateServices = $null
-            Status             = ('FAILED: ' + $_.Exception.Message)
-        }
+        $failure = New-Object PSObject
+        $failure | Add-Member -MemberType NoteProperty -Name ComputerName -Value $computer
+        $failure | Add-Member -MemberType NoteProperty -Name InstalledVersion -Value ''
+        $failure | Add-Member -MemberType NoteProperty -Name TargetVersion -Value $TargetVersion
+        $failure | Add-Member -MemberType NoteProperty -Name RollbackEnabled -Value ''
+        $failure | Add-Member -MemberType NoteProperty -Name UpdatePolicy -Value ''
+        $failure | Add-Member -MemberType NoteProperty -Name EdgeUpdateServices -Value ''
+        $failure | Add-Member -MemberType NoteProperty -Name Status -Value ('FAILED: ' + $_.Exception.Message)
+        $results += $failure
     }
 }
 
 $timeStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$resultsFile = Join-Path -Path $PSScriptRoot -ChildPath ('EdgeRollbackResults-' + $timeStamp + '.csv')
-$results | Export-Csv -Path $resultsFile -NoTypeInformation -Encoding UTF8
-
+$resultsFile = Join-Path -Path $ScriptFolder -ChildPath ('EdgeRollbackResults-' + $timeStamp + '.csv')
+$results | Export-Csv -LiteralPath $resultsFile -NoTypeInformation
 $results | Format-Table -AutoSize
 Write-Host ''
 Write-Host ('Results written to: ' + $resultsFile) -ForegroundColor Green
-
-<#
-Example machines.txt:
-VM-EDGE-01
-VM-EDGE-02
-VM-EDGE-03.domain.local
-
-Run from an elevated Windows PowerShell 5.1 window:
-.\Invoke-EdgeRollback-152.0.4191.66-Fixed.ps1 -RestartEdgeUpdateService
-#>
-
