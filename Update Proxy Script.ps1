@@ -1,19 +1,3 @@
-<#
-.SYNOPSIS
-    Updates IIS HTTPS binding certificates for sites not using DefaultAppPool.
-
-.DESCRIPTION
-    Prompts for the target certificate thumbprint when the script starts.
-    Skips sites whose root application uses DefaultAppPool.
-    Updates existing HTTPS bindings only.
-    Compatible with Windows PowerShell 5.1.
-
-.NOTES
-    Run in an elevated PowerShell console.
-    The certificate must be present in Cert:\LocalMachine\My
-    and include a private key.
-#>
-
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string[]]$ExcludeAppPool = @('DefaultAppPool')
@@ -24,11 +8,8 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module WebAdministration -ErrorAction Stop
 
-# Ask for a certificate thumbprint at run time.
 do {
     $Thumbprint = Read-Host 'Enter the certificate thumbprint from Local Computer\Personal'
-
-    # Remove normal spaces, non-breaking spaces, and other pasted whitespace.
     $Thumbprint = ($Thumbprint -replace '\s', '').ToUpperInvariant()
 
     if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
@@ -65,7 +46,6 @@ Write-Host "  Valid from:   $($Certificate.NotBefore)"
 Write-Host "  Valid until:  $($Certificate.NotAfter)"
 Write-Host ''
 
-# This is a final check before changing IIS.
 $Confirmation = Read-Host 'Use this certificate for eligible IIS HTTPS bindings? Type YES to continue'
 
 if ($Confirmation -cne 'YES') {
@@ -78,13 +58,11 @@ $Results = @()
 Get-Website | ForEach-Object {
     $Site = $_
 
-    # Identify the app pool assigned to the root application ("/") of the IIS site.
-    $RootApplication = Get-WebApplication -Site $Site.Name |
-        Where-Object { $_.Path -eq '/' } |
-        Select-Object -First 1
+    # Get-Website exposes the app pool associated with the site's root application.
+    $ApplicationPool = $Site.ApplicationPool
 
-    if (-not $RootApplication) {
-        Write-Warning "Skipping '$($Site.Name)': unable to identify its root application pool."
+    if ([string]::IsNullOrWhiteSpace($ApplicationPool)) {
+        Write-Warning "Skipping '$($Site.Name)': no application pool is configured for the site."
 
         $Results += [PSCustomObject]@{
             Site               = $Site.Name
@@ -92,17 +70,15 @@ Get-Website | ForEach-Object {
             BindingInformation = ''
             PreviousThumbprint = ''
             NewThumbprint      = $Thumbprint
-            Status             = 'Skipped - Root application not found'
+            Status             = 'Skipped - No application pool configured'
         }
 
         return
     }
 
-    $ApplicationPool = $RootApplication.ApplicationPool
-
-    # Skip a site when its root application uses DefaultAppPool.
+    # Do not touch sites whose root application uses DefaultAppPool.
     if ($ExcludeAppPool -contains $ApplicationPool) {
-        Write-Host "Skipping '$($Site.Name)' because its root app pool is '$ApplicationPool'." -ForegroundColor Yellow
+        Write-Host "Skipping '$($Site.Name)' because it uses excluded app pool '$ApplicationPool'." -ForegroundColor Yellow
 
         $Results += [PSCustomObject]@{
             Site               = $Site.Name
@@ -127,7 +103,7 @@ Get-Website | ForEach-Object {
             BindingInformation = ''
             PreviousThumbprint = ''
             NewThumbprint      = $Thumbprint
-            Status             = 'Skipped - No HTTPS binding'
+            Status             = 'Skipped - No HTTPS bindings'
         }
 
         return
@@ -141,7 +117,6 @@ Get-Website | ForEach-Object {
 
         if ($PSCmdlet.ShouldProcess($Site.Name, $Action)) {
             try {
-                # IIS certificate bindings use the Local Computer Personal store: "My".
                 $Binding.AddSslCertificate($Thumbprint, 'My')
 
                 Write-Host "Updated: $($Site.Name) [$ApplicationPool] -> $BindingInformation" -ForegroundColor Green
